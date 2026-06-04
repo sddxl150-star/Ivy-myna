@@ -207,7 +207,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { api } from '../store.js'
 
 const emit = defineEmits(['close', 'changed'])
@@ -223,6 +223,14 @@ const fetchError = ref('')
 const fetchedModels = ref([])
 const modelFilter = ref('')
 const selectedModels = ref([])
+
+watch(selectedModels, (val) => {
+  if (val.length === 1) {
+    form.model = val[0]
+  } else if (val.length === 0) {
+    form.model = ''
+  }
+}, { deep: true })
 
 const form = reactive({
   id: null,
@@ -247,6 +255,7 @@ function resetFetched() {
   // If user changes URL/key after fetch, invalidate model list
   fetchedModels.value = []
   fetchError.value = ''
+  selectedModels.value = []
 }
 
 function startNew() {
@@ -258,6 +267,7 @@ function startNew() {
   fetchedModels.value = []
   fetchError.value = ''
   modelFilter.value = ''
+  selectedModels.value = []
   mode.value = 'fetch'
   showAdvanced.value = false
   testResult.value = null
@@ -287,6 +297,7 @@ function startEdit(m) {
   fetchedModels.value = []
   fetchError.value = ''
   modelFilter.value = ''
+  selectedModels.value = []
   mode.value = 'fetch'
   showAdvanced.value = false
   testResult.value = null
@@ -295,6 +306,7 @@ function startEdit(m) {
 
 function cancelEdit() {
   editingModel.value = false
+  selectedModels.value = []
 }
 
 async function fetchModels() {
@@ -346,6 +358,9 @@ const filteredModels = computed(() => {
 
 async function selectModel(id) {
   form.model = id
+  if (!selectedModels.value.includes(id)) {
+    selectedModels.value = [id]
+  }
   modelFilter.value = ''
   // Try to enrich ctx from metadata
   try {
@@ -365,6 +380,7 @@ async function selectModel(id) {
 
 function clearSelectedModel() {
   form.model = ''
+  selectedModels.value = []
 }
 
 function toggleModel(id) {
@@ -446,7 +462,7 @@ async function saveBatchModels() {
   const namePrefix = form.name.trim() || baseUrl.split('//')[1]?.split('/')[0] || 'Model'
   
   let successCount = 0
-  let failCount = 0
+  const failedModels = []
   
   for (const modelId of selectedModels.value) {
     const payload = {
@@ -466,17 +482,17 @@ async function saveBatchModels() {
       if (res.ok) {
         successCount++
       } else {
-        failCount++
-        console.error(`Failed to save ${modelId}:`, res.error)
+        failedModels.push(modelId)
       }
     } catch(e) {
-      failCount++
-      console.error(`Error saving ${modelId}:`, e)
+      failedModels.push(modelId)
     }
   }
   
-  if (failCount > 0) {
-    alert(`批量创建完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+  if (failedModels.length > 0) {
+    alert(`批量创建完成：成功 ${successCount} 个，失败 ${failedModels.length} 个\n\n失败模型：\n${failedModels.join('\n')}`)
+  } else {
+    alert(`批量创建完成：成功 ${successCount} 个`)
   }
   
   editingModel.value = false
