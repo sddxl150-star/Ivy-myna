@@ -194,7 +194,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { api } from '../store.js'
 
 const emit = defineEmits(['close', 'changed'])
@@ -209,6 +209,14 @@ const fetching = ref(false)
 const fetchError = ref('')
 const fetchedModels = ref([])
 const modelFilter = ref('')
+
+watch(selectedModels, (val) => {
+  if (val.length === 1) {
+    form.model = val[0]
+  } else if (val.length === 0) {
+    form.model = ''
+  }
+}, { deep: true })
 
 const form = reactive({
   id: null,
@@ -233,6 +241,7 @@ function resetFetched() {
   // If user changes URL/key after fetch, invalidate model list
   fetchedModels.value = []
   fetchError.value = ''
+  selectedModels.value = []
 }
 
 function startNew() {
@@ -244,6 +253,7 @@ function startNew() {
   fetchedModels.value = []
   fetchError.value = ''
   modelFilter.value = ''
+  selectedModels.value = []
   mode.value = 'fetch'
   showAdvanced.value = false
   testResult.value = null
@@ -273,6 +283,7 @@ function startEdit(m) {
   fetchedModels.value = []
   fetchError.value = ''
   modelFilter.value = ''
+  selectedModels.value = []
   mode.value = 'fetch'
   showAdvanced.value = false
   testResult.value = null
@@ -281,6 +292,7 @@ function startEdit(m) {
 
 function cancelEdit() {
   editingModel.value = false
+  selectedModels.value = []
 }
 
 async function fetchModels() {
@@ -332,6 +344,9 @@ const filteredModels = computed(() => {
 
 async function selectModel(id) {
   form.model = id
+  if (!selectedModels.value.includes(id)) {
+    selectedModels.value = [id]
+  }
   modelFilter.value = ''
   // Try to enrich ctx from metadata
   try {
@@ -351,6 +366,7 @@ async function selectModel(id) {
 
 function clearSelectedModel() {
   form.model = ''
+  selectedModels.value = []
 }
 
 const canSave = computed(() => {
@@ -391,9 +407,54 @@ async function saveModel() {
     editingModel.value = false
     await load()
     emit('changed')
-  } else {
-    alert('保存失败：' + (res.error || '未知错误'))
   }
+}
+
+async function saveBatchModels() {
+  if (!canSaveBatch.value) return
+  const params = { api_mode: form.api_mode }
+  const baseUrl = form.base_url.trim()
+  const apiKey = form.api_key
+  const namePrefix = form.name.trim() || baseUrl.split('//')[1]?.split('/')[0] || 'Model'
+  
+  let successCount = 0
+  const failedModels = []
+  
+  for (const modelId of selectedModels.value) {
+    const payload = {
+      name: `${namePrefix} - ${modelId}`,
+      provider: 'openai',
+      base_url: baseUrl,
+      model: modelId,
+      temperature: form.temperature,
+      max_tokens: form.max_tokens,
+      is_default: 0,
+      params_json: JSON.stringify(params),
+    }
+    if (apiKey) payload.api_key = apiKey
+    
+    try {
+      const res = await api('POST', '/admin/models', payload)
+      if (res.ok) {
+        successCount++
+      } else {
+        failedModels.push(modelId)
+      }
+    } catch(e) {
+      failedModels.push(modelId)
+    }
+  }
+  
+  if (failedModels.length > 0) {
+    alert(`批量创建完成：成功 ${successCount} 个，失败 ${failedModels.length} 个\n\n失败模型：\n${failedModels.join('\n')}`)
+  } else {
+    alert(`批量创建完成：成功 ${successCount} 个`)
+  }
+  
+  editingModel.value = false
+  selectedModels.value = []
+  await load()
+  emit('changed')
 }
 
 async function remove(m) {
