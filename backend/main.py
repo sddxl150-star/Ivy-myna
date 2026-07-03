@@ -431,7 +431,7 @@ def _share_page_html(room_id: str) -> str:
   <script>
     const roomId = {room_json};
     const escapeHtml = (s) => String(s ?? '').replace(/[&<>\"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[c]));
-    const linkifyHiddenUrls = (s) => escapeHtml(s).replace(/https?:\/\/[^\s<]+/g, url => `<a href="${{url}}" target="_blank" rel="noopener noreferrer">查看链接</a>`).replace(/\n/g, '<br>');
+    const linkifyHiddenUrls = (s) => escapeHtml(s).replace(/https?:\/\/[^\s<]+/g, url => `<a href="${{url}}" target="_blank" rel="noopener noreferrer">查看链接</a>`).replace(/\\n/g, '<br>');
     const formatTime = (v) => {{ try {{ return v ? new Date(v).toLocaleString() : ''; }} catch {{ return v || ''; }} }};
     const isSelf = (m) => m.sender_id === 'user';
     const isEvent = (m) => m.sender_id === 'system' || m.event;
