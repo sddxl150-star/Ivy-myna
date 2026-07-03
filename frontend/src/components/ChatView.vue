@@ -1237,10 +1237,11 @@ async function copyMsg(msg) {
 
 async function shareRoom() {
   const relativeUrl = `/share/${encodeURIComponent(props.room.id)}`
+  const absoluteUrl = new URL(relativeUrl, window.location.origin).href
   const label = '查看聊天记录'
-  const markdownLink = `[${label}](${relativeUrl})`
-  const safeRelativeUrl = relativeUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-  const htmlLink = `<a href="${safeRelativeUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`
+  const markdownLink = `[${label}](${absoluteUrl})`
+  const safeAbsoluteUrl = absoluteUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+  const htmlLink = `<a href="${safeAbsoluteUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`
   try {
     if (navigator.clipboard && window.ClipboardItem) {
       await navigator.clipboard.write([
@@ -1262,7 +1263,7 @@ async function shareRoom() {
     document.execCommand('copy')
     document.body.removeChild(textarea)
   }
-  showToast('已复制分享入口，页面中不会明文显示服务器地址')
+  showToast('已复制可打开的聊天记录链接')
 }
 
 // Auto-update thread title on first message
