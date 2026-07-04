@@ -956,6 +956,18 @@ function normalizeUrlHref(url) {
   return `https://${url}`
 }
 
+const BARE_URL_PREFIX_RE = /^(https?:\/\/[A-Za-z0-9](?:[A-Za-z0-9\-._~:\/?#[\]@!$&'()*+,;=%]*[A-Za-z0-9\/_~#=%-])?|www\.[A-Za-z0-9](?:[A-Za-z0-9\-._~:\/?#[\]@!$&'()*+,;=%]*[A-Za-z0-9\/_~#=%-])?)/i
+const URL_TRAILING_PUNCT_RE = /[.,;:!?，。；：！？、)）\]】}》>]+$/
+
+function splitBareUrlText(rawText) {
+  const text = String(rawText || '')
+  const match = text.match(BARE_URL_PREFIX_RE)
+  if (!match) return null
+  const urlText = match[0].replace(URL_TRAILING_PUNCT_RE, '')
+  if (!urlText) return null
+  return { urlText, restText: text.slice(urlText.length) }
+}
+
 function autoLinkUrls(text) {
   const protectedSegments = []
   const fileLikeExtensions = new Set([
@@ -980,9 +992,10 @@ function autoLinkUrls(text) {
   const urlPattern = new RegExp(String.raw`(^|[\s>（(])((?:(?:https?:\/\/|www\.)${urlChars}+)|(?:localhost(?::\d+)?(?:[/?#]${urlTail})?)|(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]${urlTail})?)|(?:(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]${urlTail})?))`, 'gi')
 
   linked = linked.replace(urlPattern, (match, prefix, rawUrl) => {
-    const trailingMatch = rawUrl.match(/[),.，。！？!?;；:：]+$/)
-    const trailing = trailingMatch ? trailingMatch[0] : ''
-    const url = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl
+    const split = splitBareUrlText(rawUrl)
+    if (!split) return match
+    const url = split.urlText
+    const trailing = split.restText
     const lowerUrl = url.toLowerCase()
     const explicitUrl = /^(?:https?:\/\/|www\.|localhost(?::|[/?#]|$)|(?:\d{1,3}\.){3}\d{1,3})/i.test(url)
     const pathStart = lowerUrl.search(/[/?#:]/)
