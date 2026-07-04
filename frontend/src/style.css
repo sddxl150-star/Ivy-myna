@@ -949,24 +949,31 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 }
 .msg .msg-text strong { font-weight: 700; }
 .msg .msg-text a.message-link {
-  color: var(--accent);
+  color: #2563eb;
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: rgba(37, 99, 235, 0.45);
+  text-underline-offset: 3px;
   cursor: pointer;
   pointer-events: auto;
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
 }
 .msg .msg-text a.message-link:hover {
-  color: var(--accent-hover);
+  color: #1d4ed8;
+  text-decoration-color: currentColor;
 }
 .msg-group.self .msg .msg-text a.message-link {
-  color: #bbf7d0;
+  color: #dbeafe;
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: rgba(219, 234, 254, 0.65);
+  text-underline-offset: 3px;
   cursor: pointer;
   pointer-events: auto;
 }
 .msg-group.self .msg .msg-text a.message-link:hover {
-  color: #dcfce7;
+  color: #ffffff;
+  text-decoration-color: currentColor;
 }
 .msg .msg-text .at-mention {
   color: var(--accent);
