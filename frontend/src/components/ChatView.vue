@@ -19,6 +19,37 @@
       </button>
     </div>
 
+    <div v-if="type === 'dm'" class="room-search-row">
+      <div class="search-bar room-search-bar">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <input type="search" v-model.trim="roomSearchQuery" placeholder="搜索聊天记录..." aria-label="搜索聊天记录">
+        <button v-if="roomSearchQuery" class="room-search-clear" @click="clearRoomSearch" aria-label="清空搜索">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div v-if="roomSearchQuery" class="room-search-results">
+        <div v-if="!roomSearchResults.length" class="room-search-state">没有匹配的消息</div>
+        <button
+          v-for="result in visibleRoomSearchResults"
+          :key="result.id"
+          class="room-search-result"
+          @click="jumpToRoomSearchResult(result.id)"
+        >
+          <span class="room-search-result-head">
+            <span>{{ result.sender_name || '消息' }}</span>
+            <span>{{ formatMsgTime(result.created_at) }}</span>
+          </span>
+          <span class="room-search-result-text">{{ result.text }}</span>
+        </button>
+        <button
+          v-if="roomSearchResults.length > visibleRoomSearchResults.length"
+          class="room-search-more"
+          type="button"
+          disabled
+        >还有 {{ roomSearchResults.length - visibleRoomSearchResults.length }} 条结果，请继续输入缩小范围</button>
+      </div>
+    </div>
+
     <!-- Group info panel (replaces messages area when active) -->
     <div v-if="type === 'group' && showSettings" class="group-info-panel">
       <RoomInfoPanel ref="roomInfoPanel" :room="room" @changed="onMembersChanged" @close="showSettings = false" @deleted="$emit('close')" />
@@ -41,7 +72,7 @@
       <template v-for="(group, gi) in messageGroups" :key="gi">
         <div v-if="group.separator" class="time-separator"><span>{{ group.separator }}</span></div>
         <div class="msg-group" :class="{ self: group.self, event: group.event }">
-          <div v-for="(msg, mi) in group.messages" :key="msg.id || mi" class="msg" :class="{ self: group.self, streaming: msg.streaming, event: msg.event }">
+          <div v-for="(msg, mi) in group.messages" :key="msg.id || mi" class="msg" :data-message-id="msg.id" :class="{ self: group.self, streaming: msg.streaming, event: msg.event, 'search-hit': roomSearchHitId === msg.id }">
             <div v-if="msg.showName" class="sender-name">{{ msg.sender_name }}</div>
             <!-- Text/tools content in chronological order -->
             <template v-if="msg.parts && msg.parts.length">
@@ -382,6 +413,8 @@ const activeThreadId = ref(null)
 const threadDrawerOpen = ref(false)
 const showPlusMenu = ref(false)
 const showShortcutBar = ref(false)
+const roomSearchQuery = ref('')
+const roomSearchHitId = ref(null)
 
 const hasActiveStreamInView = computed(() => Object.values(store.activeStreams).some(s => s.roomId === props.room.id && (s.threadId || null) === activeThreadId.value && !s.interrupted))
 const hasGroupAiMembers = computed(() => props.type === 'group' && (props.room.members || []).some(m => m.id !== 'user' && m.id !== 'system'))
@@ -610,6 +643,32 @@ const subtitle = computed(() => {
   if (props.type === 'group') return (props.room.members?.length || 0) + ' 个成员'
   return ''
 })
+
+const roomSearchResults = computed(() => {
+  const q = roomSearchQuery.value.trim().toLowerCase()
+  if (!q) return []
+  return messages.value
+    .filter(m => String(m.text || '').toLowerCase().includes(q))
+    .slice()
+    .reverse()
+})
+const visibleRoomSearchResults = computed(() => roomSearchResults.value.slice(0, 8))
+
+function clearRoomSearch() {
+  roomSearchQuery.value = ''
+  roomSearchHitId.value = null
+}
+
+function jumpToRoomSearchResult(messageId) {
+  roomSearchHitId.value = messageId
+  nextTick(() => {
+    const el = messagesArea.value?.querySelector?.(`[data-message-id="${messageId}"]`)
+    el?.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
+    setTimeout(() => {
+      if (roomSearchHitId.value === messageId) roomSearchHitId.value = null
+    }, 2200)
+  })
+}
 
 const canSend = computed(() => inputText.value.trim().length > 0 || attachments.value.length > 0)
 
