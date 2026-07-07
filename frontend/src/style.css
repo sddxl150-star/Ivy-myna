@@ -1046,21 +1046,23 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 .msg .msg-text strong { font-weight: 700; }
-.msg .msg-text a.message-link {
-  color: #2563eb;
+.msg .msg-text a.message-link,
+.msg .msg-text a.message-link:visited {
+  color: #3b82f6;
   text-decoration: underline;
   text-decoration-thickness: 1px;
-  text-decoration-color: rgba(37, 99, 235, 0.45);
+  text-decoration-color: rgba(59, 130, 246, 0.45);
   text-underline-offset: 3px;
   cursor: pointer;
   pointer-events: auto;
   transition: color 0.15s ease, text-decoration-color 0.15s ease;
 }
 .msg .msg-text a.message-link:hover {
-  color: #1d4ed8;
+  color: #2563eb;
   text-decoration-color: currentColor;
 }
-.msg-group.self .msg .msg-text a.message-link {
+.msg-group.self .msg .msg-text a.message-link,
+.msg-group.self .msg .msg-text a.message-link:visited {
   color: #dbeafe;
   text-decoration: underline;
   text-decoration-thickness: 1px;
