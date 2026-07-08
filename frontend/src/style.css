@@ -1259,9 +1259,11 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 .msg .msg-text strong { font-weight: 700; }
+.msg .msg-text a,
+.msg .msg-text a:visited,
 .msg .msg-text a.message-link,
 .msg .msg-text a.message-link:visited {
-  color: #3b82f6;
+  color: #60a5fa;
   text-decoration: underline;
   text-decoration-thickness: 1px;
   text-decoration-color: rgba(59, 130, 246, 0.45);
@@ -1270,10 +1272,13 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   pointer-events: auto;
   transition: color 0.15s ease, text-decoration-color 0.15s ease;
 }
+.msg .msg-text a:hover,
 .msg .msg-text a.message-link:hover {
-  color: #2563eb;
+  color: #93c5fd;
   text-decoration-color: currentColor;
 }
+.msg-group.self .msg .msg-text a,
+.msg-group.self .msg .msg-text a:visited,
 .msg-group.self .msg .msg-text a.message-link,
 .msg-group.self .msg .msg-text a.message-link:visited {
   color: #dbeafe;
@@ -1284,6 +1289,7 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   cursor: pointer;
   pointer-events: auto;
 }
+.msg-group.self .msg .msg-text a:hover,
 .msg-group.self .msg .msg-text a.message-link:hover {
   color: #ffffff;
   text-decoration-color: currentColor;
