@@ -48,6 +48,7 @@ class WSManager:
                 "agent_id": payload.get("agent_id"),
                 "agent_name": payload.get("agent_name"),
                 "thread_id": payload.get("thread_id"),
+                "model_name": payload.get("actual_model") or payload.get("model_name") or payload.get("model"),
                 "text": "",
                 "tool_calls": [],
                 "parts": [],
@@ -55,6 +56,11 @@ class WSManager:
                 "interrupted": False,
             }
             self._stream_last_activity[payload["stream_id"]] = time.time()
+        elif payload.get("type") == "stream_model":
+            stream = self.active_streams.get(payload.get("stream_id", ""))
+            if stream:
+                stream["model_name"] = payload.get("actual_model") or payload.get("model_name") or payload.get("model") or stream.get("model_name")
+                self._stream_last_activity[payload.get("stream_id", "")] = time.time()
         elif payload.get("type") == "stream_interrupted":
             stream = self.active_streams.get(payload.get("stream_id", ""))
             if stream:
@@ -104,7 +110,7 @@ class WSManager:
 
         data = json.dumps(payload)
         dead = set()
-        for ws in self.ui_connections:
+        for ws in list(self.ui_connections):
             try:
                 await ws.send_text(data)
             except Exception:

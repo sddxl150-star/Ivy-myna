@@ -11,9 +11,6 @@
       <div class="sidebar-icon" :class="{ active: page === 'agents' }" @click="page = 'agents'" :title="tr('智能体')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a4 4 0 0 1 4 4v2a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/></svg>
       </div>
-      <div class="sidebar-icon" :class="{ active: page === 'quickstart' }" @click="page = 'quickstart'" :title="tr('快速开始')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L4 14h7l-1 8 10-13h-7l1-7z"/></svg>
-      </div>
       <div class="sidebar-icon" :class="{ active: page === 'admin' }" @click="page = 'admin'" :title="tr('管理中心')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
       </div>
@@ -54,7 +51,6 @@
 
       <!-- Admin and Settings should use the full desktop workspace. -->
       <div v-else class="desktop-workspace-panel">
-        <QuickStartPage v-if="page === 'quickstart'" @open-room="openQuickStartRoom" />
         <AdminCenter v-if="page === 'admin'" />
         <SettingsPage v-if="page === 'settings'" @open-room="openSettingsRoom" />
       </div>
@@ -91,7 +87,6 @@
           </template>
         </ChatList>
         <AgentList v-if="page === 'agents'" @open-detail="openAgentDetail" @create-agent="showModal('agent')" @deleted-agent="onAgentDeleted" />
-        <QuickStartPage v-if="page === 'quickstart'" @open-room="openQuickStartRoom" />
         <AdminCenter v-if="page === 'admin'" />
         <SettingsPage v-if="page === 'settings'" @open-room="openSettingsRoom" />
         <ChatView v-if="currentRoom" :key="currentRoom.id" :room="currentRoom" :type="currentRoomType" @close="closeChat" />
@@ -105,10 +100,6 @@
         <div class="nav-item" :class="{ active: page === 'agents' }" @click="page = 'agents'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a4 4 0 0 1 4 4v2a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/></svg>
           <span class="label">{{ tr('智能体') }}</span>
-        </div>
-        <div class="nav-item" :class="{ active: page === 'quickstart' }" @click="page = 'quickstart'">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L4 14h7l-1 8 10-13h-7l1-7z"/></svg>
-          <span class="label">{{ tr('快速') }}</span>
         </div>
         <div class="nav-item" :class="{ active: page === 'admin' }" @click="page = 'admin'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
@@ -178,17 +169,17 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, provide, computed, watch, nextTick } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, provide, computed, watch, nextTick, defineAsyncComponent } from 'vue'
 import ChatList from './components/ChatList.vue'
 import ChatView from './components/ChatView.vue'
-import AgentList from './components/AgentList.vue'
-import AgentDetail from './components/AgentDetail.vue'
- import QuickStartPage from './components/QuickStartPage.vue'
- import SettingsPage from './components/SettingsPage.vue'
-import AdminCenter from './components/AdminCenter.vue'
 import RoomModal from './components/RoomModal.vue'
-import AgentModal from './components/AgentModal.vue'
 import LoginPage from './components/LoginPage.vue'
+
+const AgentList = defineAsyncComponent(() => import('./components/AgentList.vue'))
+const AgentDetail = defineAsyncComponent(() => import('./components/AgentDetail.vue'))
+const SettingsPage = defineAsyncComponent(() => import('./components/SettingsPage.vue'))
+const AdminCenter = defineAsyncComponent(() => import('./components/AdminCenter.vue'))
+const AgentModal = defineAsyncComponent(() => import('./components/AgentModal.vue'))
 import { api, ws, auth, setAuthToken, clearAuth, updateInfo, checkForUpdate, store, loadConversations, loadAgents } from './store.js'
 import { currentLanguage, initI18n, languages, languageState, setLanguage, translatePageNow, tr } from './i18n.js'
 
@@ -280,10 +271,6 @@ function openSettingsRoom(room) {
   openChat(room, 'group')
 }
 
-function openQuickStartRoom(room) {
-  page.value = 'chats'
-  openChat(room, 'group')
-}
 
 function onAgentCreated(agent) {
   modals.agent = false

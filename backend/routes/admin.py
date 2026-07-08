@@ -9,11 +9,161 @@ from datetime import datetime
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
 from workspaces import get_room_workspace_info
-from paths import APP_ROOT, PROFILES_ROOT, WORKSPACES_ROOT
+from paths import APP_ROOT, PROFILES_ROOT
+from routes.auth import current_tenant_id, get_current_account, is_admin_account, is_authenticated
 
 router = APIRouter()
 
 MENTION_RE = r"@([^\s@,，.。;；:：!！?？]+)"
+RESERVED_AGENT_IDS = {"system", "user", "__system__", "__all__"}
+SKILL_CREATE_RE = re.compile(
+    r"^(?:请|麻烦|帮我)?\s*(?:(?:给|为|帮)\s*@?[^\s@,，。；;:：!！?？]{2,32}\s*)?"
+    r"(?:创建|新建|保存|学习|记录|加入|添加)\s*(?:一个|一条|本次|这个|此)?\s*(?:skill|技能)\s*(?=[：:《\"“'])",
+    re.I,
+)
+SKILL_TITLE_RE = re.compile(r"(?:skill|技能)[：:《\"“']+\s*([^\n,，。；;:：》\"”']{2,48})", re.I)
+SKILL_TARGET_RE = re.compile(r"(?:给|为|帮)\s*@?([^\s@,，。；;:：!！?？]{2,32})\s*(?:创建|新建|保存|学习|记录|添加|加入)")
+
+
+def is_real_agent(agent: dict | None) -> bool:
+    return bool(agent and agent.get("id") not in RESERVED_AGENT_IDS and agent.get("name"))
+
+
+def _clean_skill_name(value: str) -> str:
+    name = re.sub(r"^(?:一个|一条|本次|这个|此)?\s*(?:skill|技能)\s*", "", value or "", flags=re.I).strip()
+    name = re.split(r"(?:\s+|[，,。\n；;])(?:内容|步骤|规则|流程|要求)\s*[：:]?", name, maxsplit=1)[0]
+    name = re.split(r"[。\n；;]", name, maxsplit=1)[0].strip(" ：:《》\"'“”`*#")
+    return name[:48]
+
+
+def _strip_message_source_prefix(text: str) -> str:
+    """Remove UI/chat sender prefixes before command parsing."""
+    return re.sub(r"^\s*\[[^\]]{1,32}\]\s*[：:]\s*", "", text or "").strip()
+
+
+def _looks_like_skill_meta_discussion(text: str) -> bool:
+    """Guard against discussions/corrections that merely mention skill creation."""
+    normalized = _strip_message_source_prefix(text)
+    lowered = normalized.lower()
+    negative_markers = (
+        "我再说一遍", "不是让你", "不是叫你", "不要", "别", "禁止", "不能",
+        "别自己", "不要自己", "不要创建", "别创建",
+    )
+    routing_markers = ("调用 open code", "调用 opencode", "open code", "opencode")
+    meta_markers = ("优化创建 skill 的策略", "优化创建技能的策略", "创建 skill 的策略", "创建技能的策略")
+    if any(marker in normalized for marker in negative_markers):
+        return True
+    if any(marker in lowered for marker in routing_markers):
+        return True
+    if any(marker in normalized for marker in meta_markers):
+        return True
+    return False
+
+
+def _extract_skill_request(text: str) -> dict | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    normalized = _strip_message_source_prefix(raw)
+    if not normalized or _looks_like_skill_meta_discussion(normalized):
+        return None
+
+    # Natural-language skill creation is intentionally conservative: it must be
+    # a command at the beginning of the message, include an explicit title
+    # delimiter (技能：标题 / skill《标题》), and include explicit body content.
+    # This prevents ordinary discussion such as “创建 skill 的策略” from causing
+    # persistent skill writes.
+    if not SKILL_CREATE_RE.search(normalized):
+        return None
+
+    explicit_title = SKILL_TITLE_RE.search(normalized)
+    if not explicit_title:
+        return None
+    name = _clean_skill_name(explicit_title.group(1))
+    if not name or len(name) < 2:
+        return None
+
+    body_match = re.search(r"(?:^|[\s，,。；;\n])(?:内容|步骤|规则|流程|要求)\s*[：:]\s*(.+)", normalized, re.S)
+    if not body_match or not body_match.group(1).strip():
+        return None
+    content = body_match.group(1).strip()
+    if len(content) < 10:
+        return None
+
+    description = f"由群聊自然语言请求创建：{normalized.splitlines()[0][:80]}"
+    target_name = ""
+    target_match = SKILL_TARGET_RE.search(normalized)
+    if target_match:
+        target_name = target_match.group(1).strip(" ：:《》\"'“”`*#")
+    return {"name": name, "description": description, "content": content, "target_name": target_name}
+
+
+def _resolve_skill_targets(db, room_id: str, mentions: list | None, target_name: str = "") -> list:
+    members = [m for m in db.get_room_members(room_id) if is_real_agent(m)]
+    if target_name:
+        matched = [m for m in members if m.get("name") == target_name]
+        if matched:
+            return matched
+    if mentions:
+        mentioned = [m for m in members if m.get("id") in mentions]
+        if mentioned:
+            return mentioned
+    return members
+
+
+def _handle_natural_language_skill_create(db, room_id: str, text: str, mentions: list | None = None, thread_id: str | None = None) -> dict | None:
+    request = _extract_skill_request(text)
+    if not request:
+        return None
+    targets = _resolve_skill_targets(db, room_id, mentions, request.get("target_name", ""))
+    if not targets:
+        return {"ok": False, "error": "当前群聊没有可装载技能的真实智能体"}
+    created = []
+    for agent in targets:
+        existing = db.get_agent_skills(agent["id"])
+        same = next((s for s in existing if (s.get("name") or "").strip() == request["name"]), None)
+        if same:
+            skill = db.update_skill(same["id"], {
+                "description": request["description"],
+                "content": request["content"],
+                "file_type": "text",
+            })
+        else:
+            skill = db.create_skill(agent["id"], request["name"], request["description"], request["content"], "text")
+        db.add_room_skill(room_id, skill["id"])
+        created.append({"agent_id": agent["id"], "agent_name": agent["name"], "skill_id": skill["id"], "skill_name": skill["name"]})
+    names = "、".join([f"@{item['agent_name']}" for item in created])
+    status_text = f"✅ 已创建/更新技能「{request['name']}」，并装载到 {names}。"
+    system_message = db.create_message(room_id, "system", status_text, "markdown", None, [], thread_id=thread_id)
+    return {"ok": True, "message": system_message, "created": created}
+
+
+def resolve_real_mentions(db, text: str, mentions: list | None = None) -> list:
+    agents = {a["id"]: a for a in db.list_agents() if is_real_agent(a)}
+    resolved = []
+    for agent_id in mentions or []:
+        if agent_id in agents and agent_id not in resolved:
+            resolved.append(agent_id)
+    if resolved:
+        return resolved
+    for match in re.finditer(MENTION_RE, text):
+        mention_name = match.group(1).strip().strip("*_`~|")
+        mentioned = next((a for a in agents.values() if a["name"] == mention_name), None)
+        if mentioned and mentioned["id"] not in resolved:
+            resolved.append(mentioned["id"])
+    return resolved
+
+
+def is_low_value_collaboration_ack(text: str) -> bool:
+    """Detect status-only coordination messages that should not re-trigger agents."""
+    normalized = re.sub(r"^\[[^\]]+\]:\s*", "", text or "").strip()
+    if not normalized:
+        return False
+    status_markers = ("用户确认", "用户授权", "授权后", "等待用户", "当前状态保持不变", "状态同步", "基础自测后", "最终验收")
+    pause_markers = ("等待", "授权", "确认", "暂停", "不再继续", "不再重复", "后续", "收到", "再 @")
+    if any(marker in normalized for marker in status_markers) and any(marker in normalized for marker in pause_markers):
+        return True
+    return bool(re.search(r"(?:收到|确认)[，。,.\s]*(?:当前|测试侧|状态)|完成.*基础自测后.*再\s*@", normalized))
 
 
 def get_db(request: Request):
@@ -22,6 +172,7 @@ def get_db(request: Request):
 
 def get_ws(request: Request):
     return request.app.state.ws_manager
+
 
 
 async def _interrupt_matching_streams(ws_manager, room_id: str, mentions: list, thread_id: str | None = None):
@@ -35,6 +186,64 @@ async def _interrupt_matching_streams(ws_manager, room_id: str, mentions: list, 
         if agent_id in mentions or not mentions:
             await ws_manager.interrupt_stream(stream_id)
 
+
+def tenant_id_for_request(request: Request) -> str | None:
+    return current_tenant_id(request)
+
+
+def require_admin_account(request: Request):
+    if not is_admin_account(request):
+        return JSONResponse({"ok": False, "error": "子账号不能修改系统配置"}, status_code=403)
+    return None
+
+
+def ensure_tenant_room_access(db, room_id: str, tenant_id: str | None) -> bool:
+    if tenant_id is None:
+        return True
+    db.ensure_tenant_columns()
+    room = db.get_room(room_id)
+    return bool(room and room.get("tenant_id") == tenant_id)
+
+
+def ensure_tenant_agent_access(db, agent_id: str, tenant_id: str | None) -> bool:
+    if tenant_id is None:
+        return True
+    db.ensure_tenant_columns()
+    agent = db.get_agent_by_id(agent_id)
+    return bool(agent and agent.get("tenant_id") == tenant_id)
+
+
+def ensure_tenant_thread_access(db, thread_id: str, tenant_id: str | None) -> dict | None:
+    thread = db.get_thread(thread_id)
+    if not thread:
+        return None
+    if not ensure_tenant_room_access(db, thread.get("room_id"), tenant_id):
+        return None
+    return thread
+
+
+def ensure_tenant_workflow_access(db, workflow_id: str, tenant_id: str | None) -> dict | None:
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        return None
+    if not ensure_tenant_room_access(db, workflow.get("room_id"), tenant_id):
+        return None
+    return workflow
+
+
+def ensure_tenant_skill_access(db, skill_id: str, tenant_id: str | None) -> dict | None:
+    skill = db.get_skill_by_id(skill_id)
+    if not skill:
+        return None
+    if not ensure_tenant_agent_access(db, skill.get("agent_id"), tenant_id):
+        return None
+    return skill
+
+
+def filter_tenant_members(db, members: list, tenant_id: str | None) -> list:
+    if tenant_id is None:
+        return members
+    return [m for m in members if m.get("tenant_id") == tenant_id]
 
 # === Auth middleware (via dependency) ===
 async def check_auth(request: Request):
@@ -52,25 +261,35 @@ async def check_auth(request: Request):
 @router.get("/agents")
 async def list_agents(request: Request):
     db = get_db(request)
-    agents = db.list_agents()
+    agents = db.list_agents(tenant_id_for_request(request))
     return {"ok": True, "result": agents}
 
 
 @router.post("/agents")
 async def create_agent(request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
     body = await request.json()
     name = body.get("name")
     if not name:
         return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
-    agent = db.create_agent(name, body.get("description", ""), body.get("model_config_id"))
+    model_config_id = body.get("model_config_id") or None
+    if model_config_id and not db.get_model_config(model_config_id):
+        return JSONResponse({"ok": False, "error": "model_config_id is invalid"}, status_code=400)
+    agent = db.create_agent(name, body.get("description", ""), model_config_id, tenant_id)
     return {"ok": True, "result": agent}
 
 
 @router.put("/agents/{agent_id}")
 async def update_agent(agent_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     body = await request.json()
+    if tenant_id is not None:
+        for forbidden_key in ["status", "model_config_id", "execution_mode", "self_improve", "self_improve_threshold", "tools_config", "container_id", "sort_order"]:
+            body.pop(forbidden_key, None)
     name = body.get("name")
     if not name:
         return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
@@ -84,7 +303,9 @@ async def update_agent(agent_id: str, request: Request):
             if key == "tools_config" and not isinstance(val, str):
                 val = json.dumps(val)
             fields[key] = val
-    if "sort_order" in body:
+    if "container_id" in body:
+        fields["container_id"] = str(body.get("container_id") or "").strip() or None
+    elif "sort_order" in body:
         fields["container_id"] = str(body["sort_order"])
     db.update_agent(agent_id, fields)
     return {"ok": True}
@@ -96,6 +317,8 @@ async def delete_agent(agent_id: str, request: Request):
     if agent_id in ('__system__', 'user', 'system'):
         return JSONResponse({"ok": False, "error": "系统智能体不可删除"}, status_code=403)
     db = get_db(request)
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     db.delete_agent(agent_id)
     return {"ok": True}
 
@@ -105,29 +328,45 @@ async def delete_agent(agent_id: str, request: Request):
 @router.get("/rooms")
 async def list_rooms(request: Request):
     db = get_db(request)
-    rooms = db.list_rooms()
+    tenant_id = tenant_id_for_request(request)
+    room_type = request.query_params.get("type")
+    rooms = db.list_rooms(tenant_id, room_type)
+    if not rooms:
+        return {"ok": True, "result": []}
+
+    room_ids = [r["id"] for r in rooms]
+    members_by_room = db.get_room_members_for_rooms(room_ids)
+    last_messages_by_room = db.get_last_messages_for_rooms(room_ids)
     result = []
     for r in rooms:
-        members = db.get_room_members(r["id"])
-        msgs = db.get_room_messages(r["id"], 1)
-        last_msg = msgs[-1] if msgs else None
+        room_settings = {}
+        try:
+            room_settings = json.loads(r.get("settings_json") or "{}")
+        except Exception:
+            room_settings = {}
         workspace_info = {}
         try:
-            workspace_info = get_room_workspace_info(r["id"], db.get_room_settings(r["id"]))
+            workspace_info = get_room_workspace_info(r["id"], room_settings)
         except Exception as e:
             workspace_info = {"workspace_error": str(e)}
-        result.append({**r, "members": members, "last_message": last_msg, **workspace_info})
+        result.append({
+            **r,
+            "members": members_by_room.get(r["id"], []),
+            "last_message": last_messages_by_room.get(r["id"]),
+            **workspace_info,
+        })
     return {"ok": True, "result": result}
 
 
 @router.post("/rooms")
 async def create_room(request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
     body = await request.json()
     name = body.get("name")
     if not name:
         return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
-    room = db.create_room(name, body.get("description", ""), body.get("type", "group"))
+    room = db.create_room(name, body.get("description", ""), body.get("type", "group"), tenant_id)
     return {"ok": True, "result": room}
 
 
@@ -135,6 +374,8 @@ async def create_room(request: Request):
 async def update_room(room_id: str, request: Request):
     db = get_db(request)
     body = await request.json()
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     room = db.get_room(room_id)
     if not room:
         return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
@@ -167,6 +408,8 @@ async def update_room(room_id: str, request: Request):
 @router.delete("/rooms/{room_id}")
 async def delete_room(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     db.delete_room(room_id)
     return {"ok": True}
 
@@ -175,11 +418,19 @@ async def delete_room(room_id: str, request: Request):
 @router.post("/rooms/{room_id}/members")
 async def add_members(room_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     body = await request.json()
     agent_ids = body.get("agent_ids") or ([body["agent_id"]] if body.get("agent_id") else [])
     if not agent_ids:
         return JSONResponse({"ok": False, "error": "agent_id or agent_ids required"}, status_code=400)
     for aid in agent_ids:
+        agent = db.get_agent_by_id(aid)
+        if tenant_id is not None and (not agent or agent.get("tenant_id") != tenant_id):
+            return JSONResponse({"ok": False, "error": f"Invalid agent: {aid}"}, status_code=400)
+        if not is_real_agent(agent):
+            return JSONResponse({"ok": False, "error": f"Invalid agent: {aid}"}, status_code=400)
         db.add_member(room_id, aid, body.get("role", "member"))
     return {"ok": True, "added": len(agent_ids)}
 
@@ -187,6 +438,9 @@ async def add_members(room_id: str, request: Request):
 @router.delete("/rooms/{room_id}/members/{agent_id}")
 async def remove_member(room_id: str, agent_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id) or not ensure_tenant_agent_access(db, agent_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room or agent not found"}, status_code=404)
     db.remove_member(room_id, agent_id)
     return {"ok": True}
 
@@ -195,15 +449,32 @@ async def remove_member(room_id: str, agent_id: str, request: Request):
 @router.get("/rooms/{room_id}/messages")
 async def get_room_messages(room_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     limit = int(request.query_params.get("limit", "50"))
     before_id = request.query_params.get("before_id")
-    messages = db.get_room_messages(room_id, limit, int(before_id) if before_id else None)
+    q = request.query_params.get("q")
+    order = request.query_params.get("order", "desc")
+    if q:
+        messages = db.get_room_history(
+            room_id,
+            limit,
+            int(before_id) if before_id else None,
+            order=order,
+            q=q,
+        )
+    else:
+        messages = db.get_room_messages(room_id, limit, int(before_id) if before_id else None)
     return {"ok": True, "result": messages}
 
 
 @router.delete("/rooms/{room_id}/messages")
 async def clear_room_messages(room_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     db.clear_room_messages(room_id)
     return {"ok": True}
 
@@ -212,6 +483,11 @@ async def clear_room_messages(room_id: str, request: Request):
 @router.patch("/messages/{message_id}")
 async def update_message(message_id: int, request: Request):
     db = get_db(request)
+    message = db.get_message_by_id(message_id)
+    if not message:
+        return JSONResponse({"ok": False, "error": "Message not found"}, status_code=404)
+    if not ensure_tenant_room_access(db, message.get("room_id"), tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Message not found"}, status_code=404)
     body = await request.json()
     text = body.get("text")
     if not text:
@@ -223,6 +499,11 @@ async def update_message(message_id: int, request: Request):
 @router.delete("/messages/{message_id}")
 async def delete_message(message_id: int, request: Request):
     db = get_db(request)
+    message = db.get_message_by_id(message_id)
+    if not message:
+        return JSONResponse({"ok": False, "error": "Message not found"}, status_code=404)
+    if not ensure_tenant_room_access(db, message.get("room_id"), tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Message not found"}, status_code=404)
     db.delete_message(message_id)
     return {"ok": True}
 
@@ -231,6 +512,9 @@ async def delete_message(message_id: int, request: Request):
 @router.post("/rooms/{room_id}/send")
 async def send_message(room_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     ws_manager = get_ws(request)
     body = await request.json()
     text = body.get("text")
@@ -240,15 +524,7 @@ async def send_message(room_id: str, request: Request):
     db.ensure_system_agents()
 
     # Parse mentions
-    mentions = body.get("mentions") or []
-    if not mentions:
-        import re
-        agents = db.list_agents()
-        for m in re.finditer(MENTION_RE, text):
-            mention_name = m.group(1).strip().strip("*_`~|")
-            mentioned = next((a for a in agents if a["name"] == mention_name), None)
-            if mentioned:
-                mentions.append(mentioned["id"])
+    mentions = resolve_real_mentions(db, text, body.get("mentions") or [])
 
     # Handle /retry: delete last AI message and re-trigger
     if text.strip() == '/retry':
@@ -260,7 +536,7 @@ async def send_message(room_id: str, request: Request):
                 break
         if last_ai:
             db.delete_message(last_ai["id"])
-            ws_manager.broadcast({"type": "message_deleted", "room_id": room_id, "message_id": last_ai["id"]})
+            await ws_manager.notify_ui({"type": "message_deleted", "room_id": room_id, "message_id": last_ai["id"]})
             # Re-trigger with the last user message
             last_user = None
             for m in reversed(recent):
@@ -287,6 +563,18 @@ async def send_message(room_id: str, request: Request):
 
     message = db.create_message(room_id, "user", text, "markdown", None, mentions)
 
+    skill_result = _handle_natural_language_skill_create(db, room_id, text, mentions)
+    if skill_result:
+        if skill_result.get("message"):
+            await ws_manager.notify_ui({"type": "new_message", "room_id": room_id, "message": skill_result["message"]})
+        if not skill_result.get("ok"):
+            error_message = db.create_message(room_id, "system", f"⚠️ 技能创建失败：{skill_result.get('error', '未知错误')}")
+            await ws_manager.notify_ui({"type": "new_message", "room_id": room_id, "message": error_message})
+        return {"ok": True, "result": message, "skill_result": skill_result}
+
+    if is_low_value_collaboration_ack(text):
+        return {"ok": True, "result": message, "skipped_ai": "low_value_collaboration_ack"}
+
     # Trigger AI asynchronously
     from ai_engine import process_message
     async def _run_ai():
@@ -306,13 +594,18 @@ async def send_message(room_id: str, request: Request):
 @router.post("/dm/{agent_id}")
 async def create_dm(agent_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     agent = db.get_agent_by_id(agent_id)
     if not agent:
         return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     db.ensure_system_agents()
     dm_room = db.get_dm_room("user", agent_id)
+    if dm_room and tenant_id is not None and dm_room.get("tenant_id") != tenant_id:
+        dm_room = None
     if not dm_room:
-        dm_room = db.create_room(f"DM: {agent['name']}", "", "dm")
+        dm_room = db.create_room(f"DM: {agent['name']}", "", "dm", tenant_id)
         db.add_member(dm_room["id"], "user", "member")
         db.add_member(dm_room["id"], agent_id, "member")
     return {"ok": True, "result": {"room_id": dm_room["id"], "agent": agent}}
@@ -321,15 +614,8 @@ async def create_dm(agent_id: str, request: Request):
 @router.get("/dms")
 async def list_dms(request: Request):
     db = get_db(request)
-    dms = db.list_dm_rooms()
-    result = []
-    for dm in dms:
-        members = db.get_room_members(dm["id"])
-        msgs = db.get_room_messages(dm["id"], 1)
-        last_msg = msgs[-1] if msgs else None
-        agent = next((m for m in members if m["id"] not in ("user", "system")), None)
-        result.append({**dm, "members": members, "agent": agent, "last_message": last_msg})
-    return {"ok": True, "result": result}
+    tenant_id = tenant_id_for_request(request)
+    return {"ok": True, "result": db.list_dm_rooms_with_details(tenant_id)}
 
 
 # === Model Configs ===
@@ -344,6 +630,9 @@ async def list_models(request: Request):
 
 @router.post("/models")
 async def create_model(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     db = get_db(request)
     body = await request.json()
     for key in ["name", "provider", "base_url", "api_key", "model"]:
@@ -353,31 +642,40 @@ async def create_model(request: Request):
     return {"ok": True, "result": config}
 
 
+@router.post("/models/batch-delete")
+async def batch_delete_models(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
+    db = get_db(request)
+    body = await request.json()
+    model_ids = body.get("model_ids") or body.get("ids") or []
+    if not isinstance(model_ids, list) or not model_ids:
+        return JSONResponse({"ok": False, "error": "model_ids required"}, status_code=400)
+    deleted = db.delete_model_configs_batch(model_ids)
+    return {"ok": True, "deleted": deleted}
+
+
 @router.put("/models/{model_id}")
 async def update_model(model_id: str, request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     db = get_db(request)
     body = await request.json()
     db.update_model_config(model_id, body)
     return {"ok": True}
 
+
 @router.delete("/models/{model_id}")
 async def delete_model(model_id: str, request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     db = get_db(request)
     db.delete_model_config(model_id)
     return {"ok": True}
 
-@router.post("/models/batch-delete")
-async def batch_delete_models(request: Request):
-    db = get_db(request)
-    body = await request.json()
-    model_ids = body.get("model_ids") or body.get("ids") or []
-    if not isinstance(model_ids, list):
-        return JSONResponse({"ok": False, "error": "model_ids must be a list"}, status_code=400)
-    clean_ids = [str(model_id).strip() for model_id in model_ids if str(model_id).strip()]
-    if not clean_ids:
-        return JSONResponse({"ok": False, "error": "model_ids is required"}, status_code=400)
-    deleted = db.delete_model_configs_batch(clean_ids)
-    return {"ok": True, "deleted": deleted}
 
 # Model metadata (litellm)
 _model_metadata_cache = None
@@ -387,13 +685,19 @@ _model_metadata_time = 0
 @router.post("/config/models")
 async def fetch_provider_models(request: Request):
     """Fetch available models from a provider's /models endpoint."""
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     import httpx
     body = await request.json()
     base_url = body.get("base_url", "").rstrip("/")
     api_key_val = body.get("api_key", "")
 
-    # If no api_key provided but model_config_id given, fetch from DB
+    # If no api_key provided but model_config_id given, fetch from DB (admin only).
     if not api_key_val and body.get("model_config_id"):
+        blocked = require_admin_account(request)
+        if blocked:
+            return blocked
         db = get_db(request)
         config = db.get_model_config(body["model_config_id"])
         if config:
@@ -429,6 +733,9 @@ async def fetch_provider_models(request: Request):
 @router.post("/models/test")
 async def test_model_connection(request: Request):
     """Test a model connection by sending a simple prompt."""
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     import httpx
     body = await request.json()
     base_url = body.get("base_url", "").rstrip("/")
@@ -436,8 +743,11 @@ async def test_model_connection(request: Request):
     model = body.get("model", "gpt-4o-mini")
     api_mode = body.get("api_mode", "chat_completions")
 
-    # If no api_key provided but model_config_id given, fetch from DB
+    # If no api_key provided but model_config_id given, fetch from DB (admin only).
     if not api_key_val and body.get("model_config_id"):
+        blocked = require_admin_account(request)
+        if blocked:
+            return blocked
         db = get_db(request)
         config = db.get_model_config(body["model_config_id"])
         if config:
@@ -557,6 +867,8 @@ async def get_model_metadata(request: Request):
 @router.get("/rooms/{room_id}/threads")
 async def get_threads(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     threads = db.get_threads(room_id)
     return {"ok": True, "result": threads}
 
@@ -564,6 +876,8 @@ async def get_threads(room_id: str, request: Request):
 @router.post("/rooms/{room_id}/threads")
 async def create_thread(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     body = await request.json()
     title = body.get("title")
     if not title:
@@ -576,6 +890,8 @@ async def create_thread(room_id: str, request: Request):
 @router.put("/threads/{thread_id}")
 async def update_thread(thread_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_thread_access(db, thread_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Thread not found"}, status_code=404)
     body = await request.json()
     db.update_thread(thread_id, body)
     return {"ok": True}
@@ -584,6 +900,8 @@ async def update_thread(thread_id: str, request: Request):
 @router.delete("/threads/{thread_id}")
 async def delete_thread(thread_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_thread_access(db, thread_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Thread not found"}, status_code=404)
     db.delete_thread(thread_id)
     return {"ok": True}
 
@@ -595,8 +913,8 @@ async def respond_approval(approval_id: str, request: Request):
     """User responds to an approval request (approve/deny)."""
     from ai_engine import resolve_approval
     body = await request.json()
-    decision = body.get("decision", "deny")  # 'once', 'session', 'always', 'deny'
-    if decision not in ("once", "session", "always", "deny"):
+    decision = body.get("decision", "deny")  # command: once/session/always/deny; skill: approve/deny
+    if decision not in ("once", "session", "always", "approve", "deny"):
         decision = "deny"
     resolve_approval(approval_id, decision)
     return {"ok": True, "decision": decision}
@@ -605,8 +923,26 @@ async def respond_approval(approval_id: str, request: Request):
 @router.get("/threads/{thread_id}/messages")
 async def get_thread_messages(thread_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_thread_access(db, thread_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Thread not found"}, status_code=404)
     limit = int(request.query_params.get("limit", "30"))
-    messages = db.get_thread_messages(thread_id, limit)
+    q = request.query_params.get("q")
+    before_id = request.query_params.get("before_id")
+    order = request.query_params.get("order", "desc")
+    if q:
+        thread = db.get_thread(thread_id)
+        if not thread:
+            return JSONResponse({"ok": False, "error": "Thread not found"}, status_code=404)
+        messages = db.get_room_history(
+            thread["room_id"],
+            limit,
+            int(before_id) if before_id else None,
+            order=order,
+            q=q,
+            thread_id=thread_id,
+        )
+    else:
+        messages = db.get_thread_messages(thread_id, limit)
     return {"ok": True, "result": messages}
 
 
@@ -619,22 +955,14 @@ async def send_thread_message(thread_id: str, request: Request):
     if not text:
         return JSONResponse({"ok": False, "error": "text is required"}, status_code=400)
 
-    thread = db.get_thread(thread_id)
+    thread = ensure_tenant_thread_access(db, thread_id, tenant_id_for_request(request))
     if not thread:
         return JSONResponse({"ok": False, "error": "Thread not found"}, status_code=404)
 
     db.ensure_system_agents()
 
     # Parse mentions
-    mentions = body.get("mentions") or []
-    if not mentions:
-        import re
-        agents = db.list_agents()
-        for m in re.finditer(MENTION_RE, text):
-            mention_name = m.group(1).strip().strip("*_`~|")
-            mentioned = next((a for a in agents if a["name"] == mention_name), None)
-            if mentioned:
-                mentions.append(mentioned["id"])
+    mentions = resolve_real_mentions(db, text, body.get("mentions") or [])
 
     # Handle /retry in thread
     if text.strip() == '/retry':
@@ -646,7 +974,7 @@ async def send_thread_message(thread_id: str, request: Request):
                 break
         if last_ai:
             db.delete_message(last_ai["id"])
-            ws_manager.broadcast({"type": "message_deleted", "room_id": thread["room_id"], "message_id": last_ai["id"], "thread_id": thread_id})
+            await ws_manager.notify_ui({"type": "message_deleted", "room_id": thread["room_id"], "message_id": last_ai["id"], "thread_id": thread_id})
             last_user = None
             for m in reversed(recent):
                 if m["sender_id"] == "user" and m["id"] != last_ai["id"]:
@@ -672,6 +1000,15 @@ async def send_thread_message(thread_id: str, request: Request):
 
     message = db.create_message(thread["room_id"], "user", text, "markdown", None, mentions, thread_id=thread_id)
 
+    skill_result = _handle_natural_language_skill_create(db, thread["room_id"], text, mentions, thread_id=thread_id)
+    if skill_result:
+        if skill_result.get("message"):
+            await ws_manager.notify_ui({"type": "new_message", "room_id": thread["room_id"], "message": skill_result["message"], "thread_id": thread_id})
+        if not skill_result.get("ok"):
+            error_message = db.create_message(thread["room_id"], "system", f"⚠️ 技能创建失败：{skill_result.get('error', '未知错误')}", thread_id=thread_id)
+            await ws_manager.notify_ui({"type": "new_message", "room_id": thread["room_id"], "message": error_message, "thread_id": thread_id})
+        return {"ok": True, "result": message, "skill_result": skill_result}
+
     # Trigger AI
     from ai_engine import process_message
     asyncio.create_task(process_message(db, ws_manager, thread["room_id"], "user", text, mentions, room_type, thread_id=thread_id))
@@ -684,6 +1021,8 @@ async def send_thread_message(thread_id: str, request: Request):
 @router.get("/rooms/{room_id}/workflows")
 async def get_workflows(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     workflows = db.get_workflows(room_id)
     return {"ok": True, "result": workflows}
 
@@ -691,6 +1030,8 @@ async def get_workflows(room_id: str, request: Request):
 @router.post("/rooms/{room_id}/workflows")
 async def create_workflow(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     body = await request.json()
     name = body.get("name")
     steps_json = body.get("steps_json")
@@ -713,7 +1054,7 @@ async def create_workflow(room_id: str, request: Request):
 @router.get("/workflows/{workflow_id}")
 async def get_workflow(workflow_id: str, request: Request):
     db = get_db(request)
-    workflow = db.get_workflow(workflow_id)
+    workflow = ensure_tenant_workflow_access(db, workflow_id, tenant_id_for_request(request))
     if not workflow:
         return JSONResponse({"ok": False, "error": "Workflow not found"}, status_code=404)
     return {"ok": True, "result": workflow}
@@ -722,6 +1063,8 @@ async def get_workflow(workflow_id: str, request: Request):
 @router.put("/workflows/{workflow_id}")
 async def update_workflow(workflow_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_workflow_access(db, workflow_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Workflow not found"}, status_code=404)
     body = await request.json()
     db.update_workflow(workflow_id, body)
     scheduler = request.app.state.workflow_scheduler
@@ -733,6 +1076,8 @@ async def update_workflow(workflow_id: str, request: Request):
 @router.delete("/workflows/{workflow_id}")
 async def delete_workflow(workflow_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_workflow_access(db, workflow_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Workflow not found"}, status_code=404)
     db.delete_workflow(workflow_id)
     scheduler = request.app.state.workflow_scheduler
     if scheduler:
@@ -751,7 +1096,7 @@ async def get_workflow_runs(workflow_id: str, request: Request):
 @router.post("/workflows/{workflow_id}/trigger")
 async def run_workflow(workflow_id: str, request: Request):
     db = get_db(request)
-    workflow = db.get_workflow(workflow_id)
+    workflow = ensure_tenant_workflow_access(db, workflow_id, tenant_id_for_request(request))
     if not workflow:
         return JSONResponse({"ok": False, "error": "Workflow not found"}, status_code=404)
     runner = request.app.state.workflow_runner
@@ -778,6 +1123,8 @@ async def cancel_workflow_run(run_id: str, request: Request):
 @router.get("/agents/{agent_id}/skills")
 async def get_agent_skills(agent_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     skills = db.get_agent_skills(agent_id)
     return {"ok": True, "result": skills}
 
@@ -785,14 +1132,14 @@ async def get_agent_skills(agent_id: str, request: Request):
 @router.get("/skills")
 async def get_all_skills(request: Request):
     db = get_db(request)
-    skills = db.get_all_skills()
+    skills = db.get_all_skills(tenant_id_for_request(request))
     return {"ok": True, "result": skills}
 
 
 @router.get("/skills/{skill_id}")
 async def get_skill(skill_id: str, request: Request):
     db = get_db(request)
-    skill = db.get_skill_by_id(skill_id)
+    skill = ensure_tenant_skill_access(db, skill_id, tenant_id_for_request(request))
     if not skill:
         return JSONResponse({"ok": False, "error": "Skill not found"}, status_code=404)
     return {"ok": True, "result": skill}
@@ -801,6 +1148,8 @@ async def get_skill(skill_id: str, request: Request):
 @router.post("/agents/{agent_id}/skills")
 async def create_skill(agent_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     body = await request.json()
     name = body.get("name")
     if not name:
@@ -813,6 +1162,8 @@ async def create_skill(agent_id: str, request: Request):
 @router.put("/skills/{skill_id}")
 async def update_skill(skill_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_skill_access(db, skill_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Skill not found"}, status_code=404)
     body = await request.json()
     skill = db.update_skill(skill_id, body)
     return {"ok": True, "result": skill}
@@ -821,6 +1172,8 @@ async def update_skill(skill_id: str, request: Request):
 @router.delete("/skills/{skill_id}")
 async def delete_skill(skill_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_skill_access(db, skill_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Skill not found"}, status_code=404)
     db.delete_skill(skill_id)
     return {"ok": True}
 
@@ -836,10 +1189,15 @@ async def engine_status(request: Request):
 @router.post("/skills/{skill_id}/copy")
 async def copy_skill(skill_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_skill_access(db, skill_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Source skill not found"}, status_code=404)
     body = await request.json()
     target = body.get("target_agent_id")
     if not target:
         return JSONResponse({"ok": False, "error": "target_agent_id required"}, status_code=400)
+    if not ensure_tenant_agent_access(db, target, tenant_id):
+        return JSONResponse({"ok": False, "error": "Target agent not found"}, status_code=404)
     skill = db.copy_skill_to_agent(skill_id, target)
     if not skill:
         return JSONResponse({"ok": False, "error": "Source skill not found"}, status_code=404)
@@ -851,6 +1209,8 @@ async def copy_skill(skill_id: str, request: Request):
 @router.get("/rooms/{room_id}/skills")
 async def get_room_skills(room_id: str, request: Request):
     db = get_db(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     skills = db.get_room_skills_full(room_id)
     return {"ok": True, "result": skills}
 
@@ -858,8 +1218,14 @@ async def get_room_skills(room_id: str, request: Request):
 @router.put("/rooms/{room_id}/skills")
 async def set_room_skills(room_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     body = await request.json()
     skill_ids = body.get("skill_ids", [])
+    for sid in skill_ids:
+        if not ensure_tenant_skill_access(db, sid, tenant_id):
+            return JSONResponse({"ok": False, "error": f"Skill not found: {sid}"}, status_code=404)
     db.set_room_skills(room_id, skill_ids)
     skills = db.get_room_skills_full(room_id)
     return {"ok": True, "result": skills}
@@ -868,6 +1234,9 @@ async def set_room_skills(room_id: str, request: Request):
 @router.post("/rooms/{room_id}/skills/{skill_id}")
 async def add_room_skill(room_id: str, skill_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id) or not ensure_tenant_skill_access(db, skill_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room or skill not found"}, status_code=404)
     db.add_room_skill(room_id, skill_id)
     skills = db.get_room_skills_full(room_id)
     return {"ok": True, "result": skills}
@@ -876,6 +1245,9 @@ async def add_room_skill(room_id: str, skill_id: str, request: Request):
 @router.delete("/rooms/{room_id}/skills/{skill_id}")
 async def remove_room_skill(room_id: str, skill_id: str, request: Request):
     db = get_db(request)
+    tenant_id = tenant_id_for_request(request)
+    if not ensure_tenant_room_access(db, room_id, tenant_id) or not ensure_tenant_skill_access(db, skill_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room or skill not found"}, status_code=404)
     db.remove_room_skill(room_id, skill_id)
     skills = db.get_room_skills_full(room_id)
     return {"ok": True, "result": skills}
@@ -887,6 +1259,11 @@ async def remove_room_skill(room_id: str, skill_id: str, request: Request):
 async def get_observability_summary(request: Request):
     db = get_db(request)
     room_id = request.query_params.get("room_id")
+    tenant_id = tenant_id_for_request(request)
+    if room_id and not ensure_tenant_room_access(db, room_id, tenant_id):
+        return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
+    if tenant_id is not None and not room_id:
+        return JSONResponse({"ok": False, "error": "子账号不能查看全局观测数据"}, status_code=403)
     limit = int(request.query_params.get("limit", "100"))
     return {"ok": True, "result": db.get_observability_summary(room_id, limit)}
 
@@ -895,6 +1272,7 @@ async def get_observability_summary(request: Request):
 
 LOG_FILE = "/tmp/myna.log"
 LOG_FILE_ABSPATH = os.path.abspath(LOG_FILE)
+LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SECRET_PATTERNS = [
     (re.compile(r"(authorization\s*[:=]\s*bearer\s+)[^\s\"'<>]+", re.I), r"\1[REDACTED]"),
     (re.compile(r"(bearer\s+)[A-Za-z0-9._\-+/=]{12,}", re.I), r"\1[REDACTED]"),
@@ -902,6 +1280,36 @@ SECRET_PATTERNS = [
     (re.compile(r"((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret)\s*[:=]\s*)[^\s,;\"'{}<>]+", re.I), r"\1[REDACTED]"),
     (re.compile(r"(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret)\"\s*:\s*\")[^\"]+", re.I), r"\1[REDACTED]"),
 ]
+
+
+def _setting_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _setting_int(value, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(lower, min(parsed, upper))
+
+
+def _logging_settings_payload(db) -> dict:
+    enabled = _setting_bool(db.get_hub_setting("debug_logging_enabled", "0"))
+    level = str(db.get_hub_setting("debug_logging_level", "INFO") or "INFO").upper()
+    if level not in LOG_LEVELS:
+        level = "INFO"
+    retention_days = _setting_int(db.get_hub_setting("debug_logging_retention_days", "7"), 7, 1, 365)
+    settings = {
+        "enabled": enabled,
+        "level": level,
+        "retention_days": retention_days,
+        "log_path": LOG_FILE,
+        "max_lines": 1000,
+    }
+    return {"ok": True, **settings, "settings": settings, "result": settings}
 
 
 def _redact_log_line(line: str) -> str:
@@ -918,17 +1326,39 @@ def _is_allowed_log_file() -> bool:
 @router.get("/logging/settings")
 async def get_logging_settings(request: Request):
     db = get_db(request)
-    enabled = str(db.get_hub_setting("debug_logging_enabled", "0")).lower() in ("1", "true", "yes", "on")
-    return {"ok": True, "enabled": enabled}
+    return _logging_settings_payload(db)
+
+
+async def _update_logging_settings(request: Request):
+    db = get_db(request)
+    body = await request.json()
+    if "enabled" in body:
+        db.set_hub_setting("debug_logging_enabled", "1" if bool(body.get("enabled")) else "0")
+    if "level" in body:
+        level = str(body.get("level") or "").upper()
+        if level not in LOG_LEVELS:
+            return JSONResponse({"ok": False, "error": "日志级别无效"}, status_code=400)
+        db.set_hub_setting("debug_logging_level", level)
+    if "retention_days" in body:
+        retention_days = _setting_int(body.get("retention_days"), 7, 1, 365)
+        db.set_hub_setting("debug_logging_retention_days", str(retention_days))
+    return _logging_settings_payload(db)
 
 
 @router.put("/logging/settings")
 async def update_logging_settings(request: Request):
-    db = get_db(request)
-    body = await request.json()
-    enabled = bool(body.get("enabled"))
-    db.set_hub_setting("debug_logging_enabled", "1" if enabled else "0")
-    return {"ok": True, "enabled": enabled}
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
+    return await _update_logging_settings(request)
+
+
+@router.post("/logging/settings")
+async def post_logging_settings(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
+    return await _update_logging_settings(request)
 
 
 @router.get("/logging/recent")
@@ -937,38 +1367,46 @@ async def get_recent_logs(request: Request):
         lines = int(request.query_params.get("lines", "200"))
     except ValueError:
         lines = 200
+    requested_lines = lines
     lines = max(1, min(lines, 1000))
     if not _is_allowed_log_file():
         return JSONResponse({"ok": False, "error": "日志路径不受允许"}, status_code=400)
     if not os.path.exists(LOG_FILE):
-        return {"ok": True, "lines": [], "path": LOG_FILE}
+        return {"ok": True, "lines": [], "result": [], "path": LOG_FILE, "line_count": 0, "requested_lines": requested_lines}
     if not os.path.isfile(LOG_FILE):
         return JSONResponse({"ok": False, "error": "日志路径不可读取"}, status_code=400)
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
             recent = f.readlines()[-lines:]
-        return {"ok": True, "lines": [_redact_log_line(line) for line in recent], "path": LOG_FILE}
+        redacted = [_redact_log_line(line) for line in recent]
+        return {"ok": True, "lines": redacted, "result": redacted, "path": LOG_FILE, "line_count": len(redacted), "requested_lines": requested_lines}
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"读取日志失败：{e}"}, status_code=500)
 
 
 @router.delete("/logging/recent")
 async def clear_recent_logs(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     if not _is_allowed_log_file():
         return JSONResponse({"ok": False, "error": "日志路径不受允许"}, status_code=400)
     if not os.path.exists(LOG_FILE):
-        return {"ok": True}
+        return {"ok": True, "cleared": False, "path": LOG_FILE}
     if not os.path.isfile(LOG_FILE):
         return JSONResponse({"ok": False, "error": "日志路径不可清空"}, status_code=400)
     try:
         with open(LOG_FILE, "w", encoding="utf-8"):
             pass
-        return {"ok": True}
+        return {"ok": True, "cleared": True, "path": LOG_FILE}
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"清空日志失败：{e}"}, status_code=500)
 
 @router.get("/settings")
 async def get_settings(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     db = get_db(request)
     settings = db.get_all_hub_settings()
     # Never expose password hash to frontend
@@ -998,6 +1436,9 @@ async def get_settings(request: Request):
 
 @router.put("/settings")
 async def update_settings(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     db = get_db(request)
     body = await request.json()
     for key, value in body.items():
@@ -1017,7 +1458,6 @@ async def serve_media(path: str, download: str | None = None):
     # Try multiple locations for the file
     candidates = [
         str(PROFILES_ROOT / path),          # Hermes profiles
-        str(WORKSPACES_ROOT / path),        # Room workspaces
         f"/{path}",                         # Absolute path (e.g. /app/backend/project/...)
     ]
     full_path = None
@@ -1035,10 +1475,8 @@ async def serve_media(path: str, download: str | None = None):
     # Images and videos: inline display; everything else: force download
     is_viewable = mime.startswith("image/") or mime.startswith("video/") or mime == "application/pdf"
     if download or not is_viewable:
-        from urllib.parse import quote
-        encoded = quote(filename)
         return FileResponse(full_path, filename=filename, media_type=mime,
-                           headers={"Content-Disposition": f"attachment; filename=\"{encoded}\"; filename*=UTF-8''{encoded}"})
+                           headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     return FileResponse(full_path, media_type=mime)
 
 
@@ -1097,7 +1535,11 @@ def _version_key(version: str) -> tuple:
 
 
 @router.get("/system/check-update")
-async def check_for_update():
+async def check_for_update(request: Request = None):
+    if request is not None:
+        blocked = require_admin_account(request)
+        if blocked:
+            return blocked
     """Check GitHub tags for latest version. Server-side with caching (60s)."""
     import time, httpx
     now = time.time()
@@ -1134,6 +1576,9 @@ async def check_for_update():
 
 @router.post("/system/update")
 async def do_system_update(request: Request):
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     """Trigger container update via an external updater.
 
     A running web app should not pull/recreate its own container. Mature Docker
@@ -1245,12 +1690,12 @@ def _parse_size(s: str) -> int:
 async def token_usage_summary(request: Request):
     """Get daily total token usage summary (last N days). Requires auth."""
     if not is_authenticated(request):
-        from fastapi.responses import JSONResponse
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     db = get_db(request)
     days = int(request.query_params.get("days", "30"))
-    summary = db.get_token_daily_summary(days)
-    totals = db.get_token_daily_totals()
+    tenant_id = tenant_id_for_request(request)
+    summary = db.get_token_daily_summary(days) if tenant_id is None else db.get_token_daily_by_room(days, tenant_id).get("daily", [])
+    totals = db.get_token_daily_totals(tenant_id)
     return {"ok": True, "result": {"daily": summary, "totals": totals}}
 
 
@@ -1258,22 +1703,36 @@ async def token_usage_summary(request: Request):
 async def token_usage_by_agent(request: Request):
     """Get per-agent daily token usage breakdown. Requires auth."""
     if not is_authenticated(request):
-        from fastapi.responses import JSONResponse
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     db = get_db(request)
     days = int(request.query_params.get("days", "30"))
-    daily = db.get_token_daily_by_agent(days)
+    daily = db.get_token_daily_by_agent(days, tenant_id_for_request(request))
     return {"ok": True, "result": daily}
+
+
+@router.get("/token-usage/by-room")
+async def token_usage_by_room(request: Request):
+    """Get per-room token usage totals and daily trend. Requires auth."""
+    if not is_authenticated(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    db = get_db(request)
+    try:
+        days = int(request.query_params.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    usage = db.get_token_daily_by_room(days, tenant_id_for_request(request))
+    return {"ok": True, "result": usage}
 
 
 @router.get("/token-usage/agent/{agent_id}")
 async def token_usage_single_agent(agent_id: str, request: Request):
     """Get token usage history for a specific agent. Requires auth."""
     if not is_authenticated(request):
-        from fastapi.responses import JSONResponse
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     db = get_db(request)
     days = int(request.query_params.get("days", "30"))
+    if not ensure_tenant_agent_access(db, agent_id, tenant_id_for_request(request)):
+        return JSONResponse({"ok": False, "error": "Agent not found"}, status_code=404)
     usage = db.get_token_daily_for_agent(agent_id, days)
     agent = db.get_agent_by_id(agent_id)
     return {"ok": True, "result": {"agent": agent, "usage": usage}}
@@ -1285,8 +1744,10 @@ async def token_usage_single_agent(agent_id: str, request: Request):
 async def get_data_dir(request: Request):
     """Get current data directory information. Requires auth."""
     if not is_authenticated(request):
-        from fastapi.responses import JSONResponse
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     from paths import get_data_dir_info, _migration_pending
     info = get_data_dir_info()
     if _migration_pending:
@@ -1298,8 +1759,10 @@ async def get_data_dir(request: Request):
 async def migrate_data_dir(request: Request):
     """Migrate data to a new directory. Requires auth. App must restart after."""
     if not is_authenticated(request):
-        from fastapi.responses import JSONResponse
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    blocked = require_admin_account(request)
+    if blocked:
+        return blocked
     body = await request.json()
     new_dir = body.get("new_dir", "").strip()
     if not new_dir:

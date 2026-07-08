@@ -6,6 +6,7 @@ export default defineConfig({
   build: {
     outDir: '../src/web/public',
     emptyOutDir: true,
+    cssMinify: false,
     rollupOptions: {
       output: {
         entryFileNames: 'assets/[name]-[hash].js',
@@ -16,11 +17,12 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/admin': 'http://localhost:3456',
-      '/bot': 'http://localhost:3456',
-      '/uploads': 'http://localhost:3456',
-      '/health': 'http://localhost:3456',
-      '/ws': { target: 'ws://localhost:3456', ws: true }
+      '/admin': 'http://localhost:3455',
+      '/auth': 'http://localhost:3455',
+      '/bot': 'http://localhost:3455',
+      '/uploads': 'http://localhost:3455',
+      '/health': 'http://localhost:3455',
+      '/ws': { target: 'ws://localhost:3455', ws: true }
     }
   }
 })

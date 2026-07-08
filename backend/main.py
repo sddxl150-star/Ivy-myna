@@ -5,14 +5,13 @@ Multi-agent collaboration platform powered by Hermes Agent.
 import os
 import sys
 import asyncio
-import json
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import uvicorn
 
 # Add hermes-agent to path for direct import
@@ -30,7 +29,7 @@ from routes.system_agent import router as system_agent_router
 from workflow_engine import WorkflowRunner, WorkflowScheduler
 from credentials import CredentialStore
 from system_agent import SystemAgent
-from paths import APP_ROOT, DB_ROOT, UPLOADS_DIR, ensure_runtime_dirs
+from paths import APP_ROOT, DB_ROOT, UPLOADS_DIR, WORKSPACES_ROOT, ensure_runtime_dirs
 
 # Globals
 db = None
@@ -184,10 +183,11 @@ class AuthMiddleware:
             path == "/health" or
             path.startswith("/assets/") or
             path.startswith("/admin/media/") or
-            path.startswith("/share/") or
+            path.startswith("/media/") or
             path == "/admin/system/version" or
             path == "/api/system/version" or
             path.startswith("/uploads/") or
+            path.startswith("/share/") or
             path.endswith(".js") or path.endswith(".css") or
             path.endswith(".ico") or path.endswith(".png") or
             path.endswith(".svg") or path.endswith(".woff") or path.endswith(".woff2") or
@@ -375,8 +375,8 @@ async def health():
     }
 
 
+
 def _share_page_html(room_id: str) -> str:
-    room_json = json.dumps(room_id)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -418,8 +418,8 @@ def _share_page_html(room_id: str) -> str:
     .msg-text a {{ color:var(--accent); text-decoration:underline; text-underline-offset:2px; word-break:break-all; }}
     .msg-group.self .msg-text a {{ color:#bbf7d0; }}
     .msg-meta-row {{ display:flex; align-items:flex-end; justify-content:flex-end; gap:6px; margin-top:4px; min-width:0; }}
-    .msg-speaker, .msg-time {{ font-size:11px; color:var(--text-faint); font-weight:500; }}
-    .msg-group.self .msg-speaker, .msg-group.self .msg-time {{ color:rgba(255,255,255,.7); }}
+    .msg-speaker, .msg-model, .msg-time {{ font-size:11px; color:var(--text-faint); font-weight:500; }}
+    .msg-group.self .msg-speaker, .msg-group.self .msg-model, .msg-group.self .msg-time {{ color:rgba(255,255,255,.7); }}
     @media (max-width:640px) {{ .chat-header {{ height:56px; padding:0 14px; }} .messages-area {{ padding:12px 10px 18px; }} .msg {{ max-width:88%; padding:9px 12px; font-size:14px; }} .msg.event {{ max-width:88%; }} .title {{ font-size:15px; }} }}
   </style>
 </head>
@@ -429,13 +429,15 @@ def _share_page_html(room_id: str) -> str:
     <section id="content" class="messages-area"><div class="status">正在加载聊天记录...</div></section>
   </main>
   <script>
-    const roomId = {room_json};
+    const roomId = {room_id!r};
     const escapeHtml = (s) => String(s ?? '').replace(/[&<>\"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[c]));
     const linkifyHiddenUrls = (s) => escapeHtml(s).replace(/https?:\/\/[^\s<]+/g, url => `<a href="${{url}}" target="_blank" rel="noopener noreferrer">查看链接</a>`).replace(/\\n/g, '<br>');
     const formatTime = (v) => {{ try {{ return v ? new Date(v).toLocaleString() : ''; }} catch {{ return v || ''; }} }};
     const isSelf = (m) => m.sender_id === 'user';
     const isEvent = (m) => m.sender_id === 'system' || m.event;
-    fetch(`/share/${{encodeURIComponent(roomId)}}/data`).then(r => r.json()).then(data => {{
+    const params = new URLSearchParams(window.location.search);
+    const dataUrl = `/share/${{encodeURIComponent(roomId)}}/data${{params.toString() ? `?${{params.toString()}}` : ''}}`;
+    fetch(dataUrl).then(r => r.json()).then(data => {{
       if (!data.ok) throw new Error(data.error || '加载失败');
       document.title = `${{data.result.room.name}} - Myna 房间分享`;
       document.getElementById('title').textContent = data.result.room.name || 'Myna 房间分享';
@@ -448,7 +450,8 @@ def _share_page_html(room_id: str) -> str:
       }}).join('');
       document.getElementById('content').innerHTML = html || '<div class="status">暂无聊天记录</div>';
     }}).catch(err => {{
-      document.getElementById('content').innerHTML = `<div class="status error">${{escapeHtml(err.message || '加载失败')}}</div>`;
+      const el = document.getElementById('content');
+      el.innerHTML = `<div class="status error">${{escapeHtml(err.message || '加载失败')}}</div>`;
     }});
   </script>
 </body>
@@ -461,13 +464,28 @@ async def share_room_page(room_id: str):
 
 
 @app.get("/share/{room_id}/data")
-async def share_room_data(room_id: str):
+async def share_room_data(room_id: str, request: Request):
     room = app.state.db.get_room(room_id)
     if not room:
         return JSONResponse({"ok": False, "error": "Room not found"}, status_code=404)
     messages = app.state.db.get_all_room_messages(room_id)
+    message_ids = request.query_params.get("messages", "").strip()
+    if message_ids:
+        allowed_ids = {int(x) for x in message_ids.split(",") if x.strip().isdigit()}
+        messages = [m for m in messages if int(m.get("id") or 0) in allowed_ids]
     safe_room = {"id": room.get("id"), "name": room.get("name"), "description": room.get("description"), "type": room.get("type")}
     return {"ok": True, "result": {"room": safe_room, "messages": messages}}
+
+
+@app.get("/media/workspaces/{file_path:path}")
+async def download_workspace_file(file_path: str, download: str | None = None):
+    workspace_root = WORKSPACES_ROOT.resolve()
+    target = (workspace_root / file_path).resolve()
+    if not target.is_file() or workspace_root not in target.parents:
+        return JSONResponse({"ok": False, "error": "File not found"}, status_code=404)
+    # Let Starlette generate RFC 5987 filename*= headers for non-ASCII
+    # filenames. This avoids browser download failures for Chinese names.
+    return FileResponse(str(target), filename=target.name)
 
 
 # Serve uploaded files

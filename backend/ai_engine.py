@@ -30,15 +30,15 @@ except ImportError:
 
 # === Vision/Image Support Functions ===
 # Uploaded images are stored as markdown links in message text. When a room agent
-# only has a text LLM configured, Myna can call a separate OpenAI-compatible
-# vision model (configured globally) and inject the resulting description into
-# the text conversation history so the text LLM can reason about image contents.
+# only has a text LLM configured, we call a separate OpenAI-compatible vision
+# model (configured globally) and inject the resulting description into the text
+# conversation history so the text LLM can reason about image contents.
 _IMAGE_REF_RE = re.compile(r'!?\[([^\]]*)\]\((/uploads/[^)\s]+)\)')
 _VISION_DESC_CACHE: dict[str, str] = {}
 
 
 def _build_multimodal_content(text: str):
-    """Compatibility hook: image understanding is injected as text for Myna agents."""
+    """Compatibility hook: Myna sends text to Hermes; image understanding is injected as text."""
     return text
 
 
@@ -670,7 +670,13 @@ def _ensure_hub_agent_config(profile_dir: Path, base_url: str, api_key: str, mod
             existing = yaml.safe_load(config_path.read_text()) or {}
             prov = existing.get("providers", {}).get("hub", {})
             existing_approval = existing.get("approvals", {}).get("mode", "off")
-            if prov.get("base_url") != base_url or existing_approval != approval_mode:
+            agent_cfg = existing.get("agent", {}) if isinstance(existing.get("agent", {}), dict) else {}
+            if (
+                prov.get("base_url") != base_url
+                or existing_approval != approval_mode
+                or agent_cfg.get("tool_use_enforcement") is not False
+                or agent_cfg.get("task_completion_guidance") is not False
+            ):
                 needs_update = True
         except:
             needs_update = True
@@ -689,6 +695,15 @@ def _ensure_hub_agent_config(profile_dir: Path, base_url: str, api_key: str, mod
             },
             "approvals": {
                 "mode": approval_mode,
+            },
+            # Myna supplies its own concise gateway instructions and injects
+            # agent/room skills directly from the Myna DB. Disable Hermes'
+            # generic tool-enforcement/mandatory-skill prompt for hub profiles
+            # so simple first-turn replies do not burn tool calls before
+            # answering; agents still keep actual tools available as configured.
+            "agent": {
+                "tool_use_enforcement": False,
+                "task_completion_guidance": False,
             },
         }
         config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True))
@@ -709,6 +724,8 @@ def get_hermes_config():
     env_key = os.environ.get("AI_API_KEY", "")
     if env_key:
         return {
+            "name": os.environ.get("AI_PROVIDER_NAME", "runtime"),
+            "provider": os.environ.get("AI_PROVIDER", "openai"),
             "model": os.environ.get("AI_MODEL", "gpt-4o"),
             "base_url": os.environ.get("AI_API_BASE", "https://api.openai.com/v1"),
             "api_key": env_key,
@@ -732,6 +749,8 @@ def get_hermes_config():
                     break
 
         return {
+            "name": provider_name or provider or "runtime",
+            "provider": provider_name or provider or "custom",
             "model": config.get("model", {}).get("default", "gpt-4o"),
             "base_url": provider_config.get("base_url", "https://api.openai.com/v1"),
             "api_key": api_key,
@@ -748,6 +767,8 @@ def get_model_config_for_agent(db, agent: dict) -> dict | None:
         config = db.get_model_config(agent["model_config_id"])
     if not config:
         config = db.get_default_model_config()
+    if not config:
+        config = get_hermes_config()
     return config
 
 
@@ -797,8 +818,14 @@ def build_system_prompt(agent: dict, room_type: str, other_agents: list = None, 
 
     room_settings = room_settings or {}
     collaboration_mode = _room_collaboration_mode(room_settings)
+    room_name = (room or {}).get("name") or room_settings.get("room_name") or ""
     room_description = (room or {}).get("description") or room_settings.get("room_description") or ""
     guide_text = room_settings.get("collaboration_guide", "")
+    if room_type == "group" and isinstance(room_name, str) and room_name.strip():
+        prompt += f"""
+
+[当前群聊]
+群聊名称：{room_name.strip()}"""
     unified_guide = room_settings.get("room_guide") or ""
     if not unified_guide:
         unified_guide = "\n\n".join([s.strip() for s in [room_description, guide_text] if isinstance(s, str) and s.strip()])
@@ -930,9 +957,26 @@ def _merge_disabled_toolsets(exec_mode: str, tools_config: dict) -> list | None:
     disabled = []
     if exec_mode == "readonly":
         disabled.extend(["terminal", "file"])
+
+    # Myna already injects room/agent skills into the hub system prompt from its
+    # own database. Leaving Hermes' native skills toolset enabled adds a second
+    # mandatory "scan/load skills before replying" instruction, which commonly
+    # makes the first assistant turn spend one or more tool calls on skill_view
+    # before it can answer. Keep native Hermes skill management opt-in for hub
+    # agents; agents can still enable it explicitly via tools_config:
+    #   {"enable_hermes_skills": true}
+    # or by using allowed_toolsets that contains "skills".
     disabled.extend(tools_config.get("disabled_toolsets") or [])
     allowed = tools_config.get("allowed_toolsets") or []
-    known = ["terminal", "file", "http", "browser", "memory", "skills"]
+    hermes_skills_opted_in = bool(tools_config.get("enable_hermes_skills")) or "skills" in allowed
+    if not hermes_skills_opted_in:
+        disabled.append("skills")
+
+    known = [
+        "terminal", "file", "http", "browser", "memory", "skills", "web",
+        "vision", "image_gen", "todo", "session_search", "clarify",
+        "code_execution", "delegation", "cronjob", "messaging",
+    ]
     if allowed:
         disabled.extend([name for name in known if name not in allowed])
     unique = []
@@ -1235,7 +1279,7 @@ async def run_hermes_agent(agent: dict, history: list, system_prompt: str,
                         system_message=system_prompt,
                         conversation_history=history[:-1] if len(history) > 1 else None,
                     )
-                    return result.get("final_response", "") if isinstance(result, dict) else str(result)
+                    return result if isinstance(result, dict) else {"final_response": str(result)}
                 finally:
                     reset_hermes_home_override(token)
                     if old_yolo is None:
@@ -1252,7 +1296,20 @@ async def run_hermes_agent(agent: dict, history: list, system_prompt: str,
                         from tools.terminal_tool import set_approval_callback
                         set_approval_callback(None)
 
-            final_text = await loop.run_in_executor(_executor, _run_hermes_sync)
+            final_result = await loop.run_in_executor(_executor, _run_hermes_sync)
+            if isinstance(final_result, dict):
+                actual_model = final_result.get("actual_model") or final_result.get("response_model") or final_result.get("model")
+                if actual_model and callbacks.get("on_actual_model"):
+                    callbacks["on_actual_model"](actual_model)
+
+                input_tokens = int(final_result.get("input_tokens") or final_result.get("prompt_tokens") or 0)
+                output_tokens = int(final_result.get("output_tokens") or final_result.get("completion_tokens") or 0)
+                if callbacks.get("on_token_usage") and (input_tokens or output_tokens):
+                    await callbacks["on_token_usage"](input_tokens, output_tokens)
+
+                final_text = final_result.get("final_response", "")
+            else:
+                final_text = str(final_result) if final_result is not None else ""
 
             # Don't send final_text again — _stream_delta already sent tokens incrementally
             # if final_text and on_token:
@@ -1270,6 +1327,59 @@ async def run_hermes_agent(agent: dict, history: list, system_prompt: str,
     # Fallback: Direct OpenAI-compatible API call with tool use
     return await direct_api_call(base_url, api_key, model, system_prompt, history,
                                   max_tokens, temperature, callbacks, disabled_toolsets)
+
+
+def _format_model_failure_message(error: str, *, status_code: int | None = None, model: str | None = None) -> str:
+    """Return a user-visible, actionable model failure message."""
+    raw = (error or "").strip()
+    lower = raw.lower()
+    model_part = f"（模型：{model}）" if model else ""
+    retry_match = re.search(r"after\s+(\d+)\s+retr(?:y|ies)", lower)
+    retries = retry_match.group(1) if retry_match else None
+
+    if status_code == 429 or "429" in lower or "rate limit" in lower or "too many requests" in lower:
+        reason = "模型服务限流 / 请求过多"
+        advice = "稍等 1–3 分钟后重试，或切换到其它模型；如果多人同时调用，建议降低并发。"
+    elif status_code in {401, 403} or "unauthorized" in lower or "forbidden" in lower or "invalid api key" in lower:
+        reason = "模型 API Key 或权限配置异常"
+        advice = "检查模型配置里的 API Key、Base URL、账号额度和该模型权限。"
+    elif status_code and status_code >= 500 or "timeout" in lower or "timed out" in lower or "request timed out" in lower:
+        reason = "模型服务超时或上游不可用"
+        advice = "稍后重试；如果持续出现，建议切换备用模型或检查上游服务状态。"
+    elif status_code == 400 or "bad request" in lower or "not supported" in lower:
+        reason = "模型请求参数或所选模型不支持当前调用"
+        advice = "检查模型名称、接口模式、max_tokens、图片/工具调用能力是否匹配。"
+    else:
+        reason = "模型调用失败"
+        advice = "请重试；如果仍失败，检查模型配置、网络和上游返回。"
+
+    detail = raw[:300] if raw else f"HTTP {status_code}" if status_code else "无详细错误"
+    retry_line = f"\n已重试次数：{retries}" if retries else ""
+    return f"⚠️ 任务未完成{model_part}\n\n失败原因：{reason}{retry_line}\n错误详情：{detail}\n\n建议处理：{advice}"
+
+
+def _normalize_model_failure_reply(reply: str | None, *, model: str | None = None) -> str | None:
+    """Convert raw upstream/model failure strings into user-readable task status."""
+    if not reply:
+        return reply
+    raw = reply.strip()
+    lower = raw.lower()
+    looks_like_failure = (
+        raw.startswith("API call failed")
+        or "too many requests" in lower
+        or "rate limit" in lower
+        or "timeout" in lower
+        or "timed out" in lower
+        or "network" in lower
+        or "connection" in lower
+        or re.search(r"http\s+(429|5\d\d)\b", lower)
+    )
+    already_formatted = raw.startswith("⚠️ 任务未完成") or raw.startswith("⚠️ 模型")
+    if looks_like_failure and not already_formatted:
+        status_match = re.search(r"http\s+(\d{3})", lower)
+        status_code = int(status_match.group(1)) if status_match else None
+        return _format_model_failure_message(raw, status_code=status_code, model=model)
+    return reply
 
 
 async def direct_api_call(base_url: str, api_key: str, model: str,
@@ -1303,58 +1413,68 @@ async def direct_api_call(base_url: str, api_key: str, model: str,
     total_input_tokens = 0
     total_output_tokens = 0
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        for round_num in range(8):
-            body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
-            # Ensure multimodal content is properly serialized
-            # OpenAI API accepts list-type content for vision models
-            if TOOL_DEFINITIONS:
-                body["tools"] = TOOL_DEFINITIONS
-                body["tool_choice"] = "auto"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            for round_num in range(8):
+                body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+                if TOOL_DEFINITIONS:
+                    body["tools"] = TOOL_DEFINITIONS
+                    body["tool_choice"] = "auto"
 
-            resp = await client.post(url, json=body, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
-            if resp.status_code != 200:
-                print(f"[AI] API error {resp.status_code}: {resp.text[:200]}")
-                return None
+                resp = await client.post(url, json=body, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+                if resp.status_code != 200:
+                    print(f"[AI] API error {resp.status_code}: {resp.text[:200]}")
+                    return _format_model_failure_message(resp.text, status_code=resp.status_code, model=model)
 
-            data = resp.json()
-            choice = data.get("choices", [{}])[0]
-            msg = choice.get("message", {})
+                data = resp.json()
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
 
-            # Capture real token usage from API response
-            usage = data.get("usage", {})
-            total_input_tokens += usage.get("prompt_tokens", 0)
-            total_output_tokens += usage.get("completion_tokens", 0)
+                usage = data.get("usage", {})
+                total_input_tokens += usage.get("prompt_tokens", 0)
+                total_output_tokens += usage.get("completion_tokens", 0)
 
-            if not msg.get("tool_calls"):
-                text = msg.get("content", "")
-                if text and on_token:
-                    await on_token(text)
-                # Report token usage via callback
-                if callbacks.get("on_token_usage"):
-                    await callbacks["on_token_usage"](total_input_tokens, total_output_tokens)
-                return text or None
+                if not msg.get("tool_calls"):
+                    text = msg.get("content", "")
+                    if not text and round_num == 0:
+                        print(f"[AI] Empty model content for {model}, retrying once")
+                        messages.append({"role": "user", "content": "上一次响应为空。请直接输出可见文本；如果需要执行工具，请调用工具，不要返回空内容。"})
+                        continue
+                    if text and on_token:
+                        await on_token(text)
+                    if callbacks.get("on_token_usage"):
+                        await callbacks["on_token_usage"](total_input_tokens, total_output_tokens)
+                    return text or _format_model_failure_message(
+                        "模型接口返回成功，但没有返回正文内容（已自动重试一次）。",
+                        model=model,
+                    )
 
-            messages.append(msg)
-            for tc in msg["tool_calls"]:
-                fn_name = tc["function"]["name"]
-                try:
-                    fn_args = json.loads(tc["function"]["arguments"])
-                except:
-                    fn_args = {}
+                messages.append(msg)
+                for tc in msg["tool_calls"]:
+                    fn_name = tc["function"]["name"]
+                    try:
+                        fn_args = json.loads(tc["function"]["arguments"])
+                    except:
+                        fn_args = {}
 
-                summary = _tool_summary(fn_name, fn_args)
-                if on_tool_call:
-                    await on_tool_call({"name": fn_name, "args": fn_args, "summary": summary})
+                    summary = _tool_summary(fn_name, fn_args)
+                    if on_tool_call:
+                        await on_tool_call({"name": fn_name, "args": fn_args, "summary": summary})
 
-                result = await _execute_tool(fn_name, fn_args)
+                    result = await _execute_tool(fn_name, fn_args)
 
-                if on_tool_result:
-                    await on_tool_result({"name": fn_name, "ok": result["ok"], "output": result["output"]})
+                    if on_tool_result:
+                        await on_tool_result({"name": fn_name, "ok": result["ok"], "output": result["output"]})
 
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result["output"][:4000]})
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result["output"][:4000]})
+    except httpx.TimeoutException as e:
+        print(f"[AI] API timeout: {e}")
+        return _format_model_failure_message(str(e) or "Request timed out.", model=model)
+    except httpx.HTTPError as e:
+        print(f"[AI] API HTTP error: {e}")
+        return _format_model_failure_message(str(e), model=model)
 
-    return None
+    return _format_model_failure_message("模型连续执行工具后仍未生成最终回复。", model=model)
 
 
 def _tool_summary(name: str, args: dict) -> str:
@@ -1423,6 +1543,45 @@ async def _execute_tool(name: str, args: dict) -> dict:
     except Exception as e:
         return {"ok": False, "output": f"Error: {str(e)}"}
 
+
+
+def _get_private_memory_messages(db, user_id: str, agent_id: str, limit: int = 12) -> list:
+    # Return recent DM messages between the current user and this agent.
+    if not user_id or user_id in ("system", "__system__") or user_id == agent_id:
+        return []
+    ph = db._placeholder()
+    rows = db.fetchall(f"""
+        SELECT m.*, a.name as sender_name
+        FROM messages m
+        JOIN rooms r ON r.id = m.room_id
+        JOIN room_members user_rm ON user_rm.room_id = r.id AND user_rm.agent_id = {ph}
+        JOIN room_members agent_rm ON agent_rm.room_id = r.id AND agent_rm.agent_id = {ph}
+        JOIN agents a ON a.id = m.sender_id
+        WHERE r.type = 'dm'
+          AND m.sender_id IN ({ph}, {ph})
+        ORDER BY m.id DESC
+        LIMIT {ph}
+    """, (user_id, agent_id, user_id, agent_id, limit))
+    return list(reversed(rows))
+
+
+def _format_private_memory_for_prompt(messages: list, agent_id: str) -> str:
+    if not messages:
+        return ""
+    lines = [
+        "【私聊共享记忆】",
+        "以下是当前发言用户与你在私聊中的最近对话，仅用于理解用户偏好、背景和连续任务。",
+        "不要主动向群聊公开这些私聊内容；只有当用户明确要求或任务确实需要时，才可概括使用相关信息。",
+    ]
+    for m in messages:
+        speaker = "你" if m.get("sender_id") == agent_id else (m.get("sender_name") or "用户")
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        if len(text) > 800:
+            text = text[:800] + "..."
+        lines.append(f"- {speaker}: {text}")
+    return "\n".join(lines)
 
 def _build_handoff_context(from_agent: dict, reply_text: str, tool_calls: list, chain_depth: int) -> str:
     """Build a compact context summary for the next agent in the chain."""
@@ -1503,6 +1662,11 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                             responding_agents.append(agent)
                         except:
                             pass
+    elif sender_id == "user":
+        # In group rooms, an unmentioned user message should fan out to the
+        # room's real AI members. Otherwise ordinary text/image messages in a
+        # one-agent group are persisted but never reach the agent.
+        responding_agents = [m for m in members if m["id"] not in ("user", "system")]
 
     if not responding_agents:
         return
@@ -1580,12 +1744,65 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                                             agent_skills,
                                             prompt_room_settings,
                                             room)
+
+        if room_type == "group" and chain_depth == 0:
+            try:
+                private_memory = _format_private_memory_for_prompt(
+                    _get_private_memory_messages(db, sender_id, agent["id"]),
+                    agent["id"],
+                )
+                if private_memory:
+                    system_prompt += f"\n\n{private_memory}"
+            except Exception as e:
+                print(f"[AI] Private memory load skipped: {e}")
         # Inject handoff context from upstream agent (P3: context passing)
         if handoff_context:
             system_prompt += f"\n\n{handoff_context}\n注意：你可以利用上述上游工具的结果，避免重复执行相同的操作。"
 
         stream_started_at = int(datetime.now().timestamp() * 1000)
         stream_id = f"stream_{stream_started_at}_{agent['id'][:8]}"
+
+        # Token usage tracking callback
+        configured_model_name = model_config.get("model", "") if model_config else ""
+        configured_provider_name = model_config.get("name", "") if model_config else ""
+
+        def _display_model_name(model_name: str | None = None) -> str:
+            concrete_model = (model_name or configured_model_name or "").strip()
+            provider_label = (configured_provider_name or "").strip()
+            if provider_label and concrete_model and provider_label.lower() != concrete_model.lower():
+                return f"{provider_label}/{concrete_model}"
+            return concrete_model or provider_label
+
+        runtime_model_name = _display_model_name()
+
+        provider_model_markers = {"qw", "qwe", "qwen", "openai", "custom"}
+
+        def _set_runtime_model_name(value):
+            nonlocal runtime_model_name
+            if not value:
+                return
+            candidate = str(value).strip()
+            if not candidate or candidate.lower() in provider_model_markers:
+                return
+            runtime_model_name = _display_model_name(candidate)
+            ws_manager.notify_ui_sync({
+                "type": "stream_model",
+                "stream_id": stream_id,
+                "room_id": room_id,
+                "agent_id": agent["id"],
+                "model_name": runtime_model_name,
+                "actual_model": runtime_model_name,
+            })
+
+        def _model_metadata() -> dict:
+            return {
+                "actual_model": runtime_model_name,
+                "model_name": runtime_model_name,
+                "model": runtime_model_name,
+                "configured_model": configured_model_name,
+            }
+
+        callbacks = {"on_actual_model": _set_runtime_model_name}
 
         await ws_manager.notify_ui({
             "type": "stream_start",
@@ -1595,6 +1812,8 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
             "agent_name": agent.get("name") or full_agent.get("name", ""),
             "thread_id": thread_id,
             "timestamp": stream_started_at,
+            "model_name": runtime_model_name,
+            "actual_model": runtime_model_name,
         })
 
         collected_tool_calls = []
@@ -1633,48 +1852,14 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                 "stream_id": stream_id,
             })
 
-        configured_model_name = model_config.get("model", "") if model_config else ""
-        configured_provider_name = model_config.get("name", "") if model_config else ""
+        callbacks.update({"on_token": on_token, "on_tool_call": on_tool_call, "on_tool_result": on_tool_result, "on_approval_request": on_approval_request})
 
-        def _display_model_name(model_name: str | None = None) -> str:
-            concrete_model = (model_name or configured_model_name or "").strip()
-            provider_label = (configured_provider_name or "").strip()
-            if provider_label and concrete_model and provider_label.lower() != concrete_model.lower():
-                return f"{provider_label}/{concrete_model}"
-            return concrete_model or provider_label
-
-        runtime_model_name = _display_model_name()
-        provider_model_markers = {"qw", "qwe", "qwen", "openai", "custom"}
-
-        def _set_runtime_model_name(value):
-            nonlocal runtime_model_name
-            if not value:
-                return
-            candidate = str(value).strip()
-            if not candidate or candidate.lower() in provider_model_markers:
-                return
-            runtime_model_name = _display_model_name(candidate)
-
-        def _model_metadata() -> dict:
-            return {
-                "actual_model": runtime_model_name,
-                "model_name": runtime_model_name,
-                "model": runtime_model_name,
-                "configured_model": configured_model_name,
-                "provider_name": configured_provider_name,
-            }
-
-        callbacks = {
-            "on_token": on_token,
-            "on_tool_call": on_tool_call,
-            "on_tool_result": on_tool_result,
-            "on_approval_request": on_approval_request,
-            "on_actual_model": _set_runtime_model_name,
-        }
-
-        # Token usage tracking callback
         async def on_token_usage(input_tokens, output_tokens):
             try:
+                input_tokens = int(input_tokens or 0)
+                output_tokens = int(output_tokens or 0)
+                if input_tokens + output_tokens <= 0:
+                    return
                 db.record_token_daily(
                     agent_id=agent["id"],
                     agent_name=agent.get("name", ""),
@@ -1682,6 +1867,15 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                     model=runtime_model_name,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                )
+                db.record_token_usage(
+                    room_id=room_id,
+                    thread_id=thread_id,
+                    agent_id=agent["id"],
+                    model=runtime_model_name,
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
                 )
             except Exception as e:
                 print(f"[AI] Token usage recording error: {e}")
@@ -1742,15 +1936,6 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                 reply = f"⚠️ 执行出错：{str(e)[:100]}"
         finally:
             elapsed_ms = int((time.perf_counter() - execution_started) * 1000)
-            db.record_agent_execution(
-                room_id, thread_id, agent["id"],
-                model=runtime_model_name,
-                elapsed_ms=elapsed_ms,
-                tool_calls_count=len(collected_tool_calls),
-                interrupted=cancel_event.is_set(),
-                chain_depth=chain_depth,
-                status=execution_status,
-            )
             ws_manager.unregister_stream_cancel(stream_id)
 
         # Check if cancelled
@@ -1769,11 +1954,11 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
             reply = f"⏹ 已停止（已执行 {len(collected_tool_calls)} 个工具调用）"
             metadata = {
                 **_model_metadata(),
+                "tool_calls": collected_tool_calls,
+                "parts": stream_parts,
                 "interrupted": True,
                 "stream_id": stream_id,
                 "sort_ts": stream_started_at,
-                "tool_calls": collected_tool_calls,
-                "parts": stream_parts,
                 "interrupted_tool_calls": collected_tool_calls,
             }
         else:
@@ -1784,13 +1969,21 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
             }
 
         if not reply and not collected_tool_calls and not stream_parts:
-            # Send stream_end before continuing (no message to save)
-            await ws_manager.notify_ui({"type": "stream_end", "stream_id": stream_id, "room_id": room_id, "agent_id": agent["id"], "interrupted": is_interrupted})
-            continue
+            execution_status = "empty_response"
+            reply = _format_model_failure_message(
+                "模型调用结束但没有返回任何可显示内容。",
+                model=(model_config or {}).get("model"),
+            )
+            metadata = _merge_metadata(metadata, {"empty_model_response": True})
 
         # If reply is empty but we have tool calls, save a minimal message
         if not reply and collected_tool_calls:
             reply = "（工具执行完成）"
+
+        reply = _normalize_model_failure_reply(
+            reply,
+            model=(model_config or {}).get("model"),
+        )
 
         # If interrupted, metadata/reply was already compacted above. Do not append
         # the partial streamed text here.
@@ -1798,7 +1991,22 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
             reply = "⏹ 已停止"
 
         if not is_interrupted:
-            metadata = {"tool_calls": collected_tool_calls, "parts": stream_parts} if (collected_tool_calls or stream_parts) else metadata
+            metadata = {
+                **_model_metadata(),
+                "tool_calls": collected_tool_calls,
+                "parts": stream_parts,
+            }
+
+        # Record the final status after interruption/empty-response handling.
+        db.record_agent_execution(
+            room_id, thread_id, agent["id"],
+            model=runtime_model_name,
+            elapsed_ms=elapsed_ms,
+            tool_calls_count=len(collected_tool_calls),
+            interrupted=is_interrupted,
+            chain_depth=chain_depth,
+            status=execution_status,
+        )
 
         text_mentions = []
         # Strip markdown formatting around @mentions: **@name**, *@name*, `@name`, etc.
@@ -1879,7 +2087,7 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                 db.push_update(member["id"], "message", payload)
                 await ws_manager.notify_agent(member["id"], {"type": "message", **payload})
 
-        await ws_manager.notify_ui({"type": "new_message", "room_id": room_id, "thread_id": thread_id, "message": {"id": message["id"], "room_id": room_id, "sender_id": agent["id"], "sender_name": agent.get("name") or full_agent.get("name", ""), "text": reply, "thread_id": thread_id, "created_at": datetime.now().isoformat()}})
+        await ws_manager.notify_ui({"type": "new_message", "room_id": room_id, "thread_id": thread_id, "message": {"id": message["id"], "room_id": room_id, "sender_id": agent["id"], "sender_name": agent.get("name") or full_agent.get("name", ""), "text": reply, "thread_id": thread_id, "metadata": message.get("metadata"), "created_at": datetime.now().isoformat()}})
 
         # Send stream_end AFTER message is saved
         await ws_manager.notify_ui({"type": "stream_end", "stream_id": stream_id, "room_id": room_id, "agent_id": agent["id"], "interrupted": is_interrupted})
@@ -1925,7 +2133,11 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
         # Agent-level: None = follow global switch; explicit 0/1 overrides per agent.
         agent_self_improve = full_agent.get("self_improve")
         effective_self_improve = _global_self_improve if agent_self_improve is None else bool(agent_self_improve)
-        effective_threshold = full_agent.get("self_improve_threshold") or _global_threshold
+        agent_threshold = full_agent.get("self_improve_threshold")
+        try:
+            effective_threshold = int(agent_threshold) if agent_threshold is not None else int(_global_threshold)
+        except (TypeError, ValueError):
+            effective_threshold = int(_global_threshold)
 
         if (collected_tool_calls and len(collected_tool_calls) >= effective_threshold
             and chain_depth == 0 and effective_self_improve and _global_self_improve):

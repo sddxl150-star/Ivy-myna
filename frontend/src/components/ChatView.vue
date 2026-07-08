@@ -8,13 +8,13 @@
         {{ title }}
         <span v-if="subtitle" style="font-size:12px;color:var(--text-dim);font-weight:400;margin-left:8px">{{ subtitle }}</span>
       </span>
-      <!-- Thread drawer and room action toggles -->
+      <!-- Thread drawer toggle -->
       <button class="thread-toggle-btn" :class="{ active: threadDrawerOpen }" @click="threadDrawerOpen = !threadDrawerOpen" title="对话列表">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span class="thread-toggle-count" v-if="threads.length > 0">{{ threads.length + 1 }}</span>
       </button>
-      <button v-if="type === 'group'" class="share-room-btn" @click="shareRoom" title="分享聊天记录" aria-label="分享聊天记录">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.07 0l2.83-2.83a5 5 0 0 0-7.07-7.07L11 4.93"/><path d="M14 11a5 5 0 0 0-7.07 0L4.1 13.83a5 5 0 0 0 7.07 7.07L13 19.07"/></svg>
+      <button class="thread-toggle-btn" @click="shareChatContent" title="导出聊天记录 HTML" aria-label="导出聊天记录 HTML">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.59 13.51l6.83 3.98M15.41 6.51L8.59 10.49"/></svg>
       </button>
       <button v-if="type === 'group'" class="more-btn" :class="{ active: showSettings }" @click="showSettings = !showSettings" :title="showSettings ? '返回聊天' : '群聊信息'">
         <svg v-if="!showSettings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
@@ -24,7 +24,7 @@
 
     <!-- Group info panel (replaces messages area when active) -->
     <div v-if="type === 'group' && showSettings" class="group-info-panel">
-      <RoomInfoPanel ref="roomInfoPanel" :room="room" @changed="onMembersChanged" @close="showSettings = false" @deleted="$emit('close')" />
+      <RoomInfoPanel ref="roomInfoPanel" :room="room" @changed="onMembersChanged" @close="showSettings = false" @deleted="$emit('close')" @create-agent="showSettings = false; $emit('close')" />
     </div>
 
     <!-- Chat body with optional thread panel -->
@@ -44,43 +44,74 @@
       <template v-for="(group, gi) in messageGroups" :key="gi">
         <div v-if="group.separator" class="time-separator"><span>{{ group.separator }}</span></div>
         <div class="msg-group" :class="{ self: group.self, event: group.event }">
-          <div v-for="(msg, mi) in group.messages" :key="msg.id || mi" class="msg" :class="{ self: group.self, streaming: msg.streaming, event: msg.event }">
+          <div
+            v-for="(msg, mi) in group.messages"
+            :key="msg.id || mi"
+            class="msg"
+            :class="{ self: group.self, streaming: msg.streaming, event: msg.event }"
+          >
             <div v-if="msg.showName" class="sender-name">{{ msg.sender_name }}</div>
+            <div v-if="getThinkingEvents(msg).length || getProcessTools(msg).length" class="thinking-bubble" :class="{ collapsed: !msg.thinkingExpanded }">
+              <div class="thinking-header" @click.stop="toggleThinkingExpand(msg)">
+                <span class="thinking-dot" :class="{ active: msg.streaming }"></span>
+                <span class="thinking-label">执行过程</span>
+                <span class="thinking-count">{{ getThinkingEvents(msg).length || getProcessTools(msg).length }} 步</span>
+                <svg class="thinking-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+              </div>
+              <div v-if="msg.thinkingExpanded" class="thinking-steps">
+                <div v-for="(ev, ei) in getThinkingEvents(msg)" :key="`ev-${ei}`" class="thinking-step" :class="{ running: ev.status === 'running', error: ev.status === 'error' }">
+                  <span v-if="thinkingStageLabel(ev.stage)" class="thinking-step-stage">{{ thinkingStageLabel(ev.stage) }}</span>
+                  <span class="thinking-step-content">{{ processEventText(ev) }}</span>
+                </div>
+                <div v-if="getProcessTools(msg).length" class="process-tool-list">
+                  <div v-for="(tc, ti) in getProcessTools(msg)" :key="`tool-${ti}`" class="process-tool-card" :class="{ running: tc.status === 'running', done: tc.status === 'done', error: tc.status === 'error' }">
+                    <div class="process-tool-head">
+                      <span class="process-tool-status">{{ toolStatusLabel(tc.status) }}</span>
+                      <span class="process-tool-name">{{ toolLabel(cleanText(tc.name || tc.tool) || 'tool') }}</span>
+                    </div>
+                    <div v-if="cleanText(tc.summary || tc.args_summary)" class="process-tool-summary">{{ cleanText(tc.summary || tc.args_summary) }}</div>
+                    <div v-if="cleanText(tc.result)" class="process-tool-result" :class="{ error: tc.status === 'error' }">{{ cleanText(tc.result) }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
             <!-- Text/tools content in chronological order -->
             <template v-if="msg.parts && msg.parts.length">
-              <template v-for="block in groupedMessageParts(msg)" :key="block.key">
-                <div v-if="block.type === 'toolGroup'" class="working-bubble inline-tool grouped-tools" :class="{ collapsed: !isToolGroupExpanded(msg, block.key), done: !block.hasRunning }" @selectstart.prevent.stop>
-                  <div class="working-header" @mousedown.prevent.stop="clearToolSelection" @selectstart.prevent.stop @click.stop="toggleToolGroupExpand(msg, block.key)">
-                    <svg class="working-arrow-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
-                    <span v-if="block.hasRunning" class="working-label">调用工具</span>
-                    <span class="working-count">{{ block.tools.length }} 个工具</span>
+              <template v-for="(part, pi) in msg.parts" :key="pi">
+                <div v-if="part.type === 'tool' && !getProcessTools(msg).length" class="working-bubble inline-tool" :class="{ collapsed: !getPartToolExpanded(msg, pi), done: part.status !== 'running' }">
+                  <div class="working-header" @click.stop="togglePartToolExpand(msg, pi)">
+                    <div v-if="part.status === 'running'" class="working-spinner"></div>
+                    <svg v-else-if="part.status === 'done'" class="working-done-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>
+                    <svg v-else class="working-done-icon error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                    <span class="working-label">{{ part.status === 'running' ? '调用工具' : '工具完成' }}</span>
+                    <span class="working-count">{{ toolLabel(part.name) }}</span>
                     <svg class="working-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
                   </div>
-                  <div v-if="isToolGroupExpanded(msg, block.key)" class="working-steps">
-                    <div v-for="item in block.tools" :key="item.index" class="tool-step" :class="{ running: item.part.status === 'running', done: item.part.status === 'done', error: item.part.status === 'error' }">
+                  <div v-if="getPartToolExpanded(msg, pi)" class="working-steps">
+                    <div class="tool-step" :class="{ running: part.status === 'running', done: part.status === 'done', error: part.status === 'error' }">
                       <div class="step-icon">
-                        <svg v-if="item.part.status === 'running'" class="spin-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                        <svg v-else-if="item.part.status === 'done'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>
+                        <svg v-if="part.status === 'running'" class="spin-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                        <svg v-else-if="part.status === 'done'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>
                         <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
                       </div>
                       <div class="step-body">
-                        <div class="step-name">{{ toolLabel(item.part.name) }}</div>
-                        <div class="step-summary">{{ item.part.summary }}</div>
-                        <div v-if="item.part.result" class="step-result" :class="{ error: item.part.status === 'error' }">{{ item.part.result }}</div>
+                        <div class="step-name">{{ toolLabel(part.name) }}</div>
+                        <div class="step-summary">{{ part.summary }}</div>
+                        <div v-if="part.result" class="step-result" :class="{ error: part.status === 'error' }">{{ part.result }}</div>
                       </div>
                     </div>
                   </div>
                 </div>
-                <div v-else class="msg-text" v-html="block.rendered + (msg.streaming && block.isLast ? '<span class=stream-cursor>▊</span>' : '')"></div>
+                <div v-else-if="part.type === 'text'" class="msg-text" v-html="part.rendered + (msg.streaming && pi === msg.parts.length - 1 ? '<span class=stream-cursor>▊</span>' : '')"></div>
               </template>
             </template>
             <template v-else>
               <!-- Working bubble (tool calls - streaming or saved) -->
-              <div v-if="msg.toolCalls && msg.toolCalls.length" class="working-bubble" :class="{ collapsed: !msg.toolsExpanded, done: !msg.streaming }" @selectstart.prevent.stop>
-                <div class="working-header" @mousedown.prevent.stop="clearToolSelection" @selectstart.prevent.stop @click.stop="toggleToolsExpand(msg)">
+              <div v-if="msg.toolCalls && msg.toolCalls.length" class="working-bubble" :class="{ collapsed: !msg.toolsExpanded, done: !msg.streaming }">
+                <div class="working-header" @click.stop="toggleToolsExpand(msg)">
                   <div v-if="msg.streaming" class="working-spinner"></div>
                   <svg v-else class="working-done-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>
-                  <span v-if="msg.streaming" class="working-label">工作中</span>
+                  <span class="working-label">{{ msg.streaming ? '工作中' : '工具调用' }}</span>
                   <span class="working-count">{{ msg.toolCalls.length }} 步</span>
                   <svg class="working-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
                 </div>
@@ -104,8 +135,8 @@
               <div v-else class="msg-text" v-html="msg.streaming ? (msg.rendered + '<span class=stream-cursor>▊</span>') : msg.rendered"></div>
             </template>
             <div class="msg-meta-row">
-              <span v-if="msg.modelInfo && !msg.self" class="msg-model">model {{ msg.modelInfo.name }}</span>
-              <span class="msg-time">{{ msg.streaming ? (msg.text ? '生成中...' : '思考中...') : msg.time }}</span>
+              <span v-if="msg.model" class="msg-model">{{ msg.modelName }}</span>
+              <span v-if="!isSkillStatusMessage(msg)" class="msg-time">{{ msg.streaming ? (msg.text ? '生成中...' : '思考中...') : msg.time }}</span>
               <!-- Message actions (edit/delete/mention/retry/copy) — always visible for non-streaming -->
               <span v-if="!msg.streaming && !String(msg.id).startsWith('tmp-') && !String(msg.id).startsWith('stream-')" class="msg-actions">
                 <button class="msg-action-btn danger" @click.stop="deleteMsg(msg)" title="删除">
@@ -176,7 +207,7 @@
           <div class="thread-drawer-body">
             <button class="thread-new-btn" @click="createThread">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-              <span>新建对话</span>
+              + 新建对话
             </button>
             <div class="thread-list">
               <div
@@ -243,36 +274,34 @@
       </div>
     </div>
 
-    <!-- Draggable shortcut command button (hidden when info panel showing) -->
-    <template v-if="!(type === 'group' && showSettings)">
-      <button
-        ref="shortcutBtnEl"
-        class="shortcut-trigger-btn"
-        :class="{ active: showShortcutBar }"
-        :style="shortcutBtnStyle"
-        @pointerdown="onShortcutPointerDown"
-        @touchstart.stop="onShortcutPointerDown"
-        @mousedown.prevent="onShortcutMouseDown"
-        @click.stop="onShortcutClick"
-        title="快捷指令"
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        <span>快捷指令</span>
-      </button>
-
-      <div v-if="showShortcutBar" class="shortcut-card" :style="shortcutCardStyle" @click.stop>
-        <div class="shortcut-card-head">
-          <span>快捷指令</span>
-          <button class="shortcut-close" @click="showShortcutBar = false">×</button>
+    <!-- Skill Approval dialog -->
+    <div v-if="pendingSkillApproval" class="approval-overlay">
+      <div class="approval-dialog skill-approval-dialog">
+        <div class="approval-header">
+          <span class="approval-icon">🛠️</span>
+          <span class="approval-title">{{ pendingSkillApproval.action === 'create' ? '确认学习新技能' : '确认更新技能' }}</span>
         </div>
-        <div class="shortcut-card-grid">
-          <button v-for="cmd in shortcutCommands" :key="cmd.id" class="shortcut-card-item" @click="applyShortcut(cmd)" :title="cmd.label">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path :d="cmd.icon"/></svg>
-            <span>{{ cmd.label }}</span>
-          </button>
+        <div class="approval-agent">{{ pendingSkillApproval.agentName }} 想要{{ pendingSkillApproval.action === 'create' ? '学习' : '更新' }}技能：</div>
+        <div class="skill-approval-content">
+          <div class="skill-approval-field">
+            <label>技能名称：</label>
+            <span class="skill-approval-name">{{ pendingSkillApproval.action === 'create' ? pendingSkillApproval.details.skill_name : pendingSkillApproval.details.target_skill }}</span>
+          </div>
+          <div v-if="pendingSkillApproval.details.skill_description" class="skill-approval-field">
+            <label>描述：</label>
+            <span>{{ pendingSkillApproval.details.skill_description }}</span>
+          </div>
+          <div class="skill-approval-field">
+            <label>内容：</label>
+            <pre class="skill-approval-content-view">{{ pendingSkillApproval.details.content || pendingSkillApproval.details.skill_content }}</pre>
+          </div>
+        </div>
+        <div class="approval-actions">
+          <button class="approval-btn deny" @click="respondSkillApproval('deny')">取消</button>
+          <button class="approval-btn approve" @click="respondSkillApproval('approve')">确认入库</button>
         </div>
       </div>
-    </template>
+    </div>
 
     <!-- Input bar (hidden when info panel showing) -->
     <div
@@ -287,6 +316,19 @@
       <div v-if="isDraggingFiles" class="drop-hint">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <span>松开即可添加到输入框</span>
+      </div>
+      <div v-if="showShortcutBar" ref="shortcutCard" class="shortcut-card" :style="shortcutCardStyle" @click.stop>
+        <div class="shortcut-card-head" @pointerdown="onShortcutPointerDown" title="按住拖动快捷指令浮窗">
+          <span>快捷指令</span>
+          <span class="shortcut-drag-hint">拖动调整位置</span>
+          <button class="shortcut-close" @click="showShortcutBar = false">×</button>
+        </div>
+        <div class="shortcut-card-grid">
+          <button v-for="cmd in shortcutCommands" :key="cmd.id" class="shortcut-card-item" @click="applyShortcut(cmd)" :title="cmd.label">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path :d="cmd.icon"/></svg>
+            <span>{{ cmd.label }}</span>
+          </button>
+        </div>
       </div>
       <!-- Mention popup -->
       <div v-if="showMentions && mentionCandidates.length" class="mention-popup">
@@ -329,6 +371,19 @@
         </div>
       </div>
 
+      <button
+        ref="shortcutBtnEl"
+        class="shortcut-trigger-btn"
+        :class="{ active: showShortcutBar, dragging: isShortcutDragging }"
+        :style="shortcutTriggerStyle"
+        @pointerdown="onShortcutPointerDown"
+        @click.stop="toggleShortcutBar"
+        title="快捷指令，可拖动调整位置"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span>快捷指令</span>
+      </button>
+
       <button class="file-btn plus-btn" :class="{ active: showPlusMenu }" @click="togglePlusMenu" title="上传文件">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
       </button>
@@ -361,6 +416,11 @@
       </button>
     </div>
 
+    <button v-if="showScrollBottom" class="scroll-bottom-btn" @click="scrollToBottom" title="滑到最下面">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+    </button>
+
+
     <!-- (Modal-mode RoomMembersModal removed — replaced by RoomInfoPanel inline) -->
   </div>
 </template>
@@ -369,7 +429,7 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { store, api, ws, escapeHtml, getAgentColor, getAgentIcon, loadConversations, clearUnread, currentRoomId, chatSettings, saveChatSettings, markStreamInterrupted } from '../store.js'
+import { store, api, ws, auth, escapeHtml, getAgentColor, getAgentIcon, loadConversations, clearUnread, currentRoomId, chatSettings, saveChatSettings, markStreamInterrupted } from '../store.js'
 import RoomInfoPanel from './RoomInfoPanel.vue'
 
 const props = defineProps({ room: Object, type: String })
@@ -381,13 +441,15 @@ const inputEl = ref(null)
 const fileInput = ref(null)
 const imageInput = ref(null)
 const renameInput = ref(null)
+const shortcutCard = ref(null)
 const shortcutBtnEl = ref(null)
+const shortcutViewportTick = ref(0)
 const inputText = ref('')
-const draftKey = computed(() => `draft_${props.room.id}_${activeThreadId.value || 'main'}`)
 const messages = ref([])
 const typingAgent = ref(null)
 const showSettings = ref(false)
 const pendingApproval = ref(null)
+const pendingSkillApproval = ref(null)
 const attachments = ref([])
 const isDraggingFiles = ref(false)
 const isUploadingFiles = ref(false)
@@ -397,31 +459,13 @@ const activeThreadId = ref(null)
 const threadDrawerOpen = ref(false)
 const showPlusMenu = ref(false)
 const showShortcutBar = ref(false)
+const shortcutPosition = ref({ x: null, y: null })
+const isShortcutDragging = ref(false)
+let shortcutDragState = null
+let shortcutSuppressClick = false
+const showScrollBottom = ref(false)
 
-const SHORTCUT_POS_KEY = 'myna_shortcut_btn_pos'
-const btnLeft = ref(null)
-const btnBottom = ref(100)
-let isDraggingShortcut = false
-let hasDraggedShortcut = false
-let dragStartX = 0
-let dragStartY = 0
-let dragStartLeft = 0
-let dragStartBottom = 0
-let ignoreNextShortcutClick = false
-let activeShortcutInputType = null
-
-const shortcutBtnStyle = computed(() => ({
-  left: btnLeft.value != null ? btnLeft.value + 'px' : '',
-  right: btnLeft.value != null ? 'auto' : '60px',
-  bottom: btnBottom.value + 'px',
-}))
-
-const shortcutCardStyle = computed(() => ({
-  left: btnLeft.value != null ? btnLeft.value + 'px' : '',
-  right: btnLeft.value != null ? 'auto' : '60px',
-  bottom: (btnBottom.value + 42) + 'px',
-}))
-
+// Draggable floating shortcut button
 const hasActiveStreamInView = computed(() => Object.values(store.activeStreams).some(s => s.roomId === props.room.id && (s.threadId || null) === activeThreadId.value && !s.interrupted))
 const hasGroupAiMembers = computed(() => props.type === 'group' && (props.room.members || []).some(m => m.id !== 'user' && m.id !== 'system'))
 const showEmptyAgentGuide = computed(() => props.type === 'group' && !showSettings.value && !hasGroupAiMembers.value)
@@ -450,12 +494,12 @@ const mentionQuery = ref('')
 const mentionIndex = ref(0)
 const mentionStartPos = ref(-1)
 
-let pollTimer = null
 let resizeRaf = 0
 const isComposingText = ref(false)
 
 // Tool expand state per stream
 const toolsExpandedMap = ref({})
+const thinkingExpandedMap = ref({})
 let clientOrderSeq = 0
 
 function nextClientOrder() {
@@ -487,82 +531,41 @@ const TOOL_LABELS = {
   search_files: '搜索文件',
   install_package: '安装依赖',
 }
-function toolLabel(name) { return TOOL_LABELS[name] || name }
-function groupedMessageParts(msg) {
-  const parts = Array.isArray(msg.parts) ? msg.parts : []
-  const blocks = []
-  let toolRun = []
-  let toolRunStart = -1
-  const flushTools = () => {
-    if (!toolRun.length) return
-    blocks.push({
-      type: 'toolGroup',
-      key: `tools-${toolRunStart}-${toolRun[toolRun.length - 1].index}`,
-      tools: toolRun,
-      hasRunning: toolRun.some(item => item.part.status === 'running'),
-    })
-    toolRun = []
-    toolRunStart = -1
-  }
-  parts.forEach((part, index) => {
-    if (part.type === 'tool') {
-      if (toolRunStart === -1) toolRunStart = index
-      toolRun.push({ part, index })
-      return
-    }
-    flushTools()
-    blocks.push({
-      type: 'text',
-      key: `text-${index}`,
-      rendered: part.rendered || '',
-      isLast: index === parts.length - 1,
-    })
-  })
-  flushTools()
-  return blocks
+function cleanText(value) {
+  if (value === undefined || value === null) return ''
+  const text = String(value).trim()
+  if (!text || text === 'undefined' || text === 'null') return ''
+  return text.replace(/\bundefined\b/g, '').replace(/\bnull\b/g, '').trim()
 }
-function toolPartExpandKey(msg, partIndex) {
-  const id = String(msg.id || '')
-  const sid = id.startsWith('stream-') ? id.replace('stream-', '') : `saved-${id}`
-  return `${sid}:part-${partIndex}`
+function isSkillStatusMessage(msg) {
+  if (!msg || msg.senderId !== 'system') return false
+  const text = String(msg.text || '')
+  return text.includes('已学习新技能')
+    || text.includes('已更新技能')
+    || text.includes('技能创建已取消')
+    || text.includes('技能更新已取消')
 }
 
-function isToolPartExpanded(msg, partIndex) {
-  return toolsExpandedMap.value[toolPartExpandKey(msg, partIndex)] === true
-}
-
-function toolGroupExpandKey(msg, groupKey) {
-  const id = String(msg.id || '')
-  const sid = id.startsWith('stream-') ? id.replace('stream-', '') : `saved-${id}`
-  return `${sid}:${groupKey}`
-}
-
-function isToolGroupExpanded(msg, groupKey) {
-  return toolsExpandedMap.value[toolGroupExpandKey(msg, groupKey)] === true
-}
-
-function clearToolSelection() {
-  const selection = window.getSelection?.()
-  if (selection) selection.removeAllRanges()
-  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
-}
-
-function toggleToolPartExpand(msg, partIndex) {
-  clearToolSelection()
-  const key = toolPartExpandKey(msg, partIndex)
-  toolsExpandedMap.value[key] = !isToolPartExpanded(msg, partIndex)
-}
-
-function toggleToolGroupExpand(msg, groupKey) {
-  clearToolSelection()
-  const key = toolGroupExpandKey(msg, groupKey)
-  toolsExpandedMap.value[key] = !isToolGroupExpanded(msg, groupKey)
+function toolLabel(name) { return TOOL_LABELS[name] || cleanText(name) || '工具' }
+function toolExpandKey(msg, partIndex = null) {
+  const sid = String(msg.id).startsWith('stream-') ? msg.id.replace('stream-', '') : `saved-${msg.id}`
+  return partIndex === null ? sid : `${sid}-part-${partIndex}`
 }
 
 function toggleToolsExpand(msg) {
-  clearToolSelection()
-  const sid = String(msg.id).startsWith('stream-') ? msg.id.replace('stream-', '') : `saved-${msg.id}`
-  toolsExpandedMap.value[sid] = !msg.toolsExpanded
+  const key = toolExpandKey(msg)
+  toolsExpandedMap.value[key] = !msg.toolsExpanded
+}
+
+function togglePartToolExpand(msg, partIndex) {
+  const key = toolExpandKey(msg, partIndex)
+  toolsExpandedMap.value[key] = !getPartToolExpanded(msg, partIndex)
+}
+
+function getPartToolExpanded(msg, partIndex) {
+  const key = toolExpandKey(msg, partIndex)
+  if (toolsExpandedMap.value[key] !== undefined) return toolsExpandedMap.value[key]
+  return false
 }
 
 function getToolsExpanded(sid, isStreaming) {
@@ -570,6 +573,58 @@ function getToolsExpanded(sid, isStreaming) {
   if (toolsExpandedMap.value[sid] !== undefined) return toolsExpandedMap.value[sid]
   // Default: always collapsed (user can click to expand)
   return false
+}
+
+function toggleThinkingExpand(msg) {
+  const sid = String(msg.id).startsWith('stream-') ? msg.id.replace('stream-', '') : `saved-${msg.id}`
+  thinkingExpandedMap.value[sid] = !msg.thinkingExpanded
+}
+
+function getThinkingExpanded(sid) {
+  if (thinkingExpandedMap.value[sid] !== undefined) return thinkingExpandedMap.value[sid]
+  return false
+}
+
+function thinkingStageLabel(stage) {
+  const labels = { thinking: '分析', tool_call: '调用', tool_result: '完成', final: '整理' }
+  return labels[stage] || '过程'
+}
+
+function processEventText(ev) {
+  if (!ev) return ''
+  return cleanText(ev.content) || cleanText(ev.detail) || cleanText(ev.tool) || ''
+}
+
+function getThinkingEvents(msg) {
+  const events = Array.isArray(msg?.thinkingEvents) ? msg.thinkingEvents : []
+  return events
+    .map(ev => ({
+      ...ev,
+      content: cleanText(ev?.content),
+      detail: cleanText(ev?.detail),
+      tool: cleanText(ev?.tool),
+      stage: cleanText(ev?.stage),
+    }))
+    .filter(ev => processEventText(ev))
+}
+
+function toolStatusLabel(status) {
+  if (status === 'running') return '运行中'
+  if (status === 'error') return '失败'
+  return '完成'
+}
+
+function getProcessTools(msg) {
+  const directTools = Array.isArray(msg?.toolCalls) ? msg.toolCalls : []
+  const partTools = Array.isArray(msg?.parts) ? msg.parts.filter(p => p?.type === 'tool') : []
+  const merged = []
+  for (const tool of [...directTools, ...partTools]) {
+    if (!tool) continue
+    const key = [tool.name || tool.tool || '', tool.summary || tool.args_summary || '', tool.result || '', tool.status || ''].join('|')
+    if (merged.some(existing => [existing.name || existing.tool || '', existing.summary || existing.args_summary || '', existing.result || '', existing.status || ''].join('|') === key)) continue
+    merged.push(tool)
+  }
+  return merged
 }
 
 function onSettingsChange(val) {
@@ -591,6 +646,7 @@ function onMentionClick(msg) {
   })
 }
 
+
 // === Task 2: Plus menu ===
 function togglePlusMenu() {
   showPlusMenu.value = !showPlusMenu.value
@@ -605,146 +661,16 @@ function togglePlusMenu() {
 function closePlusMenu() {
   showPlusMenu.value = false
 }
-function loadShortcutPos() {
-  try {
-    const saved = localStorage.getItem(SHORTCUT_POS_KEY)
-    if (saved) {
-      const pos = JSON.parse(saved)
-      if (pos.left != null) btnLeft.value = pos.left
-      if (pos.bottom != null) btnBottom.value = pos.bottom
-      clampShortcutPos()
-      return
-    }
-  } catch {}
-  btnLeft.value = null
-  btnBottom.value = 100
-}
-
-function saveShortcutPos() {
-  localStorage.setItem(SHORTCUT_POS_KEY, JSON.stringify({
-    left: btnLeft.value,
-    bottom: btnBottom.value,
-  }))
-}
-
-function getShortcutClientPoint(e) {
-  if (e.touches?.length) return { clientX: e.touches[0].clientX, clientY: e.touches[0].clientY }
-  return { clientX: e.clientX, clientY: e.clientY }
-}
-
-function getShortcutInputType(e) {
-  if (e.type?.startsWith('touch')) return 'touch'
-  if (e.type?.startsWith('mouse')) return 'mouse'
-  return 'pointer'
-}
-
-function clampShortcutPos() {
-  const rect = shortcutBtnEl.value?.getBoundingClientRect?.()
-  const width = rect?.width || 104
-  const height = rect?.height || 32
-  if (btnLeft.value != null) {
-    btnLeft.value = Math.max(0, Math.min(btnLeft.value, window.innerWidth - width))
-  }
-  btnBottom.value = Math.max(0, Math.min(btnBottom.value, window.innerHeight - height))
-}
-
-function onShortcutPointerDown(e) {
-  if (e.type?.startsWith('pointer') && (e.pointerType === 'touch' || e.pointerType === 'mouse')) return
-  if (isDraggingShortcut) return
-  e.stopPropagation()
-  activeShortcutInputType = getShortcutInputType(e)
-  if (activeShortcutInputType === 'pointer' && e.cancelable) e.preventDefault()
-  isDraggingShortcut = true
-  hasDraggedShortcut = false
-  const point = getShortcutClientPoint(e)
-  dragStartX = point.clientX
-  dragStartY = point.clientY
-  dragStartLeft = btnLeft.value ?? (window.innerWidth - 60 - (shortcutBtnEl.value?.offsetWidth || 104))
-  dragStartBottom = btnBottom.value
-
-  if (e.pointerId != null && shortcutBtnEl.value) {
-    try { shortcutBtnEl.value.setPointerCapture(e.pointerId) } catch {}
-  }
-
-  document.addEventListener('pointermove', onShortcutPointerMove)
-  document.addEventListener('pointerup', onShortcutPointerEnd)
-  document.addEventListener('pointercancel', onShortcutPointerEnd)
-  document.addEventListener('touchmove', onShortcutPointerMove, { passive: false })
-  document.addEventListener('touchend', onShortcutPointerEnd)
-  document.addEventListener('touchcancel', onShortcutPointerEnd)
-}
-
-function onShortcutPointerMove(e) {
-  if (!isDraggingShortcut || getShortcutInputType(e) !== activeShortcutInputType) return
-  if (e.cancelable) e.preventDefault()
-  const point = getShortcutClientPoint(e)
-  const dx = point.clientX - dragStartX
-  const dy = point.clientY - dragStartY
-  if (Math.abs(dx) > 4 || Math.abs(dy) > 4) hasDraggedShortcut = true
-  btnLeft.value = Math.round(dragStartLeft + dx)
-  btnBottom.value = Math.round(dragStartBottom - dy)
-}
-
-function onShortcutMouseDown(e) {
-  if (isDraggingShortcut) return
-  e.stopPropagation()
-  activeShortcutInputType = 'mouse'
-  isDraggingShortcut = true
-  hasDraggedShortcut = false
-  const point = getShortcutClientPoint(e)
-  dragStartX = point.clientX
-  dragStartY = point.clientY
-  dragStartLeft = btnLeft.value ?? (window.innerWidth - 60 - (shortcutBtnEl.value?.offsetWidth || 104))
-  dragStartBottom = btnBottom.value
-  document.addEventListener('mousemove', onShortcutMouseMove)
-  document.addEventListener('mouseup', onShortcutPointerEnd)
-}
-
-function onShortcutMouseMove(e) {
-  if (!isDraggingShortcut || getShortcutInputType(e) !== activeShortcutInputType) return
-  e.preventDefault()
-  const point = getShortcutClientPoint(e)
-  const dx = point.clientX - dragStartX
-  const dy = point.clientY - dragStartY
-  if (Math.abs(dx) > 4 || Math.abs(dy) > 4) hasDraggedShortcut = true
-  btnLeft.value = Math.round(dragStartLeft + dx)
-  btnBottom.value = Math.round(dragStartBottom - dy)
-}
-
-function cleanupShortcutDragListeners() {
-  document.removeEventListener('pointermove', onShortcutPointerMove)
-  document.removeEventListener('pointerup', onShortcutPointerEnd)
-  document.removeEventListener('pointercancel', onShortcutPointerEnd)
-  document.removeEventListener('touchmove', onShortcutPointerMove)
-  document.removeEventListener('touchend', onShortcutPointerEnd)
-  document.removeEventListener('touchcancel', onShortcutPointerEnd)
-  document.removeEventListener('mousemove', onShortcutMouseMove)
-  document.removeEventListener('mouseup', onShortcutPointerEnd)
-}
-
-function onShortcutPointerEnd(e) {
-  if (e && getShortcutInputType(e) !== activeShortcutInputType) return
-  cleanupShortcutDragListeners()
-  isDraggingShortcut = false
-  activeShortcutInputType = null
-  if (hasDraggedShortcut) ignoreNextShortcutClick = true
-  clampShortcutPos()
-  saveShortcutPos()
-}
-
-function onShortcutClick() {
-  if (ignoreNextShortcutClick || hasDraggedShortcut) {
-    ignoreNextShortcutClick = false
-    hasDraggedShortcut = false
+function toggleShortcutBar() {
+  if (shortcutSuppressClick) {
+    shortcutSuppressClick = false
     return
   }
-  toggleShortcutBar()
-}
-
-function toggleShortcutBar() {
   showShortcutBar.value = !showShortcutBar.value
   if (showShortcutBar.value) {
     showPlusMenu.value = false
+    clampShortcutPosition()
+    nextTick(() => { shortcutViewportTick.value++; clampShortcutPosition() })
     setTimeout(() => {
       document.addEventListener('click', closeShortcutBar, { once: true })
     }, 0)
@@ -753,6 +679,119 @@ function toggleShortcutBar() {
 function closeShortcutBar(e) {
   if (e?.target?.closest?.('.shortcut-card, .shortcut-trigger-btn')) return
   showShortcutBar.value = false
+}
+
+function closeMessageContextMenu() {
+  // The message context menu was removed, but unmount cleanup still calls this
+  // hook in older builds. Keep a safe no-op to avoid breaking chat mount/unmount.
+}
+
+const SHORTCUT_MARGIN = 10
+const shortcutTriggerSize = computed(() => {
+  shortcutViewportTick.value
+  const rect = shortcutBtnEl.value?.getBoundingClientRect?.()
+  return {
+    width: rect?.width || (window.innerWidth < 768 ? 92 : 104),
+    height: rect?.height || (window.innerWidth < 768 ? 30 : 32),
+  }
+})
+const shortcutTriggerStyle = computed(() => {
+  const p = getShortcutPosition()
+  return { left: `${p.x}px`, top: `${p.y}px`, right: 'auto', bottom: 'auto' }
+})
+const shortcutCardMetrics = computed(() => {
+  shortcutViewportTick.value
+  const vw = window.innerWidth || document.documentElement.clientWidth || 360
+  const vh = window.innerHeight || document.documentElement.clientHeight || 640
+  const mobile = vw < 768
+  const width = Math.min(mobile ? 360 : 440, vw - SHORTCUT_MARGIN * 2)
+  const measured = shortcutCard.value?.getBoundingClientRect?.()
+  const fallbackHeight = mobile ? 190 : 150
+  const height = Math.min(measured?.height || fallbackHeight, vh - SHORTCUT_MARGIN * 2)
+  return { vw, vh, width, height }
+})
+const shortcutCardStyle = computed(() => {
+  const p = getShortcutPosition()
+  const trigger = shortcutTriggerSize.value
+  const { vw, vh, width, height } = shortcutCardMetrics.value
+  const gap = 10
+  let left = p.x + trigger.width - width
+  left = Math.max(SHORTCUT_MARGIN, Math.min(left, vw - width - SHORTCUT_MARGIN))
+
+  const spaceAbove = p.y - SHORTCUT_MARGIN
+  const spaceBelow = vh - (p.y + trigger.height) - SHORTCUT_MARGIN
+  let top
+  if (spaceAbove >= height + gap || spaceAbove >= spaceBelow) top = p.y - height - gap
+  else top = p.y + trigger.height + gap
+  top = Math.max(SHORTCUT_MARGIN, Math.min(top, vh - height - SHORTCUT_MARGIN))
+
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    right: 'auto',
+    bottom: 'auto',
+    width: `${width}px`,
+    maxHeight: `${vh - SHORTCUT_MARGIN * 2}px`,
+  }
+})
+
+function getShortcutPosition() {
+  if (shortcutPosition.value.x == null || shortcutPosition.value.y == null) {
+    const vw = window.innerWidth || document.documentElement.clientWidth || 360
+    const vh = window.innerHeight || document.documentElement.clientHeight || 640
+    const trigger = shortcutTriggerSize.value
+    shortcutPosition.value = {
+      x: Math.max(SHORTCUT_MARGIN, vw - trigger.width - 60),
+      y: Math.max(SHORTCUT_MARGIN, vh - trigger.height - 100),
+    }
+  }
+  return shortcutPosition.value
+}
+
+function clampShortcutPosition() {
+  const vw = window.innerWidth || document.documentElement.clientWidth || 360
+  const vh = window.innerHeight || document.documentElement.clientHeight || 640
+  const trigger = shortcutTriggerSize.value
+  const p = getShortcutPosition()
+  shortcutPosition.value = {
+    x: Math.max(SHORTCUT_MARGIN, Math.min(p.x, vw - trigger.width - SHORTCUT_MARGIN)),
+    y: Math.max(SHORTCUT_MARGIN, Math.min(p.y, vh - trigger.height - SHORTCUT_MARGIN)),
+  }
+  try { localStorage.setItem('shortcut_floating_pos', JSON.stringify(shortcutPosition.value)) } catch {}
+}
+
+function onShortcutPointerDown(e) {
+  if (e.button !== undefined && e.button !== 0) return
+  if (e.target?.closest?.('.shortcut-close, .shortcut-card-item')) return
+  e.stopPropagation()
+  if (e.cancelable) e.preventDefault()
+  const p = getShortcutPosition()
+  shortcutDragState = { startX: e.clientX, startY: e.clientY, originX: p.x, originY: p.y, moved: false }
+  isShortcutDragging.value = true
+  e.currentTarget?.setPointerCapture?.(e.pointerId)
+  document.addEventListener('pointermove', onShortcutPointerMove, { passive: false })
+  document.addEventListener('pointerup', onShortcutPointerUp, { once: true })
+  document.addEventListener('pointercancel', onShortcutPointerUp, { once: true })
+}
+
+function onShortcutPointerMove(e) {
+  if (!shortcutDragState) return
+  if (e.cancelable) e.preventDefault()
+  const dx = e.clientX - shortcutDragState.startX
+  const dy = e.clientY - shortcutDragState.startY
+  if (Math.abs(dx) + Math.abs(dy) > 3) shortcutDragState.moved = true
+  if (!shortcutDragState.moved) return
+  shortcutPosition.value = { x: shortcutDragState.originX + dx, y: shortcutDragState.originY + dy }
+  clampShortcutPosition()
+}
+
+function onShortcutPointerUp() {
+  document.removeEventListener('pointermove', onShortcutPointerMove)
+  document.removeEventListener('pointercancel', onShortcutPointerUp)
+  if (shortcutDragState?.moved) shortcutSuppressClick = true
+  shortcutDragState = null
+  isShortcutDragging.value = false
+  clampShortcutPosition()
 }
 function onPlusUploadFile() {
   showPlusMenu.value = false
@@ -813,19 +852,6 @@ function applyShortcut(cmd) {
       if (first) mentions.push(first.id)
     }
 
-    // Add user message to UI
-    messages.value.push({
-      id: 'tmp-' + Date.now(),
-      sender_id: 'user',
-      sender_name: '我',
-        text: cmd.command,
-        created_at: new Date().toISOString(),
-        clientSortTs: Date.now(),
-        clientOrder: nextClientOrder(),
-      })
-    nextTick(scrollToBottom)
-
-    // Send to backend
     const endpoint = activeThreadId.value ? `/admin/threads/${activeThreadId.value}/send` : `/admin/rooms/${props.room.id}/send`
     api('POST', endpoint, { text: cmd.command, mentions })
     return
@@ -954,24 +980,48 @@ function renderMd(text) {
   try {
     marked.setOptions({ breaks: true, gfm: true })
 
+    const encodeMediaPath = (path) => {
+      // Preserve a leading slash for absolute paths, but do not drop the first
+      // segment for relative workspace paths like "room-id/file.xlsx".
+      const leadingSlash = path.startsWith('/')
+      const encoded = path
+        .split('/')
+        .filter((part, idx) => part || idx === 0)
+        .map((part, idx) => (idx === 0 && leadingSlash) ? '' : encodeURIComponent(part))
+        .join('/')
+      return encoded
+    }
+    const mediaUrlForPath = (path, download = false) => {
+      const encodedPath = encodeMediaPath(path)
+      const workspacePrefix = '/app/data/workspaces/'
+      if (path.startsWith(workspacePrefix)) {
+        const workspaceRelPath = path.slice(workspacePrefix.length)
+        const url = `/media/workspaces/${encodeMediaPath(workspaceRelPath).replace(/^\//, '')}`
+        return download ? `${url}?download=1` : url
+      }
+      const url = `/admin/media${encodedPath}`
+      return download ? `${url}?download=1` : url
+    }
+
     // Convert MEDIA:/path/to/file to displayable content
     // Supports: MEDIA:/path, MEDIA:`/path`, **MEDIA:** `/path`
-    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\s\n`]+)`?/g, (match, filePath) => {
-      const ext = filePath.split('.').pop().toLowerCase()
-      const mediaUrl = `/admin/media${filePath}`
+    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\n`]*?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|pdf|zip|tar|gz|7z|rar|docx?|xlsx?|pptx?|txt|md|json|csv|sql))`?/gi, (match, filePath) => {
+      const cleanPath = filePath.trim()
+      const ext = cleanPath.split('.').pop().toLowerCase()
+      const mediaUrl = mediaUrlForPath(cleanPath)
+      const fileName = cleanPath.split('/').pop()
+      const safeFileName = escapeHtml(fileName)
       if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
         return `![image](${mediaUrl})`
       } else if (['mp4', 'webm'].includes(ext)) {
         return `<video src="${mediaUrl}" controls style="max-width:100%;border-radius:8px"></video>`
       } else if (ext === 'pdf') {
-        const fileName = filePath.split('/').pop()
-        return `<a href="${mediaUrl}" target="_blank" class="file-card"><span class="file-card-icon">📄</span><span class="file-card-info"><span class="file-card-name">${fileName}</span><span class="file-card-meta">PDF 文档 · 点击预览</span></span></a>`
+        return `<a href="${mediaUrl}" target="_blank" rel="noopener noreferrer" class="file-card"><span class="file-card-icon">📄</span><span class="file-card-info"><span class="file-card-name">${safeFileName}</span><span class="file-card-meta">PDF 文档 · 点击预览</span></span></a>`
       } else {
-        const fileName = filePath.split('/').pop()
-        const downloadUrl = `${mediaUrl}?download=1`
+        const downloadUrl = mediaUrlForPath(cleanPath, true)
         const icons = { zip: '🗜️', tar: '🗜️', gz: '🗜️', '7z': '🗜️', rar: '🗜️', doc: '📝', docx: '📝', xls: '📊', xlsx: '📊', ppt: '📽️', pptx: '📽️', txt: '📃', md: '📃', json: '📋', csv: '📊', sql: '🗃️' }
         const icon = icons[ext] || '📎'
-        return `<a href="${downloadUrl}" download="${fileName}" class="file-card"><span class="file-card-icon">${icon}</span><span class="file-card-info"><span class="file-card-name">${fileName}</span><span class="file-card-meta">${ext.toUpperCase()} 文件 · 点击下载</span></span><span class="file-card-dl">⬇</span></a>`
+        return `<a href="${downloadUrl}" download="${safeFileName}" class="file-card"><span class="file-card-icon">${icon}</span><span class="file-card-info"><span class="file-card-name">${safeFileName}</span><span class="file-card-meta">${ext.toUpperCase()} 文件 · 点击下载</span></span><span class="file-card-dl">⬇</span></a>`
       }
     })
 
@@ -1013,11 +1063,13 @@ const messageGroups = computed(() => {
   messages.value.forEach(m => {
     const event = m.sender_id === 'system'
     const self = m.sender_id === 'user'
-    // Parse metadata for tool_calls, chronological parts, handoff info, and model info
+    // Parse metadata for tool_calls, chronological parts, and handoff info
     let toolCalls = null
     let parts = null
+    let thinkingEvents = null
     let handoffInfo = null
     let modelInfo = null
+    let modelNameInfo = null
     if (m.metadata) {
       try {
         const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata
@@ -1027,6 +1079,11 @@ const messageGroups = computed(() => {
         if (meta.parts && meta.parts.length > 0) {
           parts = meta.parts.map(p => p.type === 'text' ? { ...p, rendered: cachedRenderMd(p.text, `${m.id}-part-${p.text?.length || 0}`) } : p)
         }
+        if (meta.thinking_events && meta.thinking_events.length > 0) {
+          thinkingEvents = meta.thinking_events
+            .map(ev => ({ ...ev, content: cleanText(ev?.content), detail: cleanText(ev?.detail), tool: cleanText(ev?.tool) }))
+            .filter(ev => processEventText(ev))
+        }
         if (meta.interrupted && meta.stream_id && store.activeStreams[meta.stream_id]?.interrupted) {
           replacedInterruptedStreams.add(meta.stream_id)
         }
@@ -1034,10 +1091,9 @@ const messageGroups = computed(() => {
         if (meta.handoff) {
           handoffInfo = meta.handoff
         }
-        if (meta.model || meta.model_name) {
-          modelInfo = {
-            name: meta.model_name || meta.model,
-          }
+        if (meta.model || meta.model_name || meta.actual_model) {
+          modelInfo = meta.model || meta.actual_model
+          modelNameInfo = meta.model_name || meta.actual_model || meta.model
         }
       } catch {}
     }
@@ -1062,9 +1118,12 @@ const messageGroups = computed(() => {
       showName: !self && !event && (props.type === 'group' || !self),
       toolCalls,
       parts,
+      thinkingEvents,
+      thinkingExpanded: thinkingEvents || toolCalls || parts ? getThinkingExpanded(`saved-${m.id}`) : false,
       toolsExpanded: toolCalls ? getToolsExpanded(`saved-${m.id}`, false) : false,
       handoffInfo,
-      modelInfo,
+      model: modelInfo,
+      modelName: modelNameInfo,
     })
   })
   const latestUserSortTs = allMsgs
@@ -1099,6 +1158,8 @@ const messageGroups = computed(() => {
       streaming: !s.interrupted,
       interrupted: s.interrupted,
       working: s.working,
+      thinkingEvents: s.thinkingEvents || [],
+      thinkingExpanded: getThinkingExpanded(sid),
       parts: (s.parts || []).map(p => p.type === 'text' ? { ...p, rendered: renderMd(p.text) } : p),
       toolCalls: s.toolCalls || [],
       toolsExpanded: getToolsExpanded(sid, true), // streaming = true
@@ -1171,10 +1232,6 @@ async function fetchThreads() {
 function selectThread(threadId) {
   activeThreadId.value = threadId
   messages.value = []
-  nextTick(() => {
-    const d = localStorage.getItem(draftKey.value)
-    inputText.value = d || ''
-  })
   fetchMessages({ forceScroll: true })
 }
 
@@ -1306,37 +1363,6 @@ async function copyMsg(msg) {
   }
 }
 
-async function shareRoom() {
-  const relativeUrl = `/share/${encodeURIComponent(props.room.id)}`
-  const absoluteUrl = new URL(relativeUrl, window.location.origin).href
-  const label = '查看聊天记录'
-  const markdownLink = `[${label}](${absoluteUrl})`
-  const safeAbsoluteUrl = absoluteUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-  const htmlLink = `<a href="${safeAbsoluteUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`
-  try {
-    if (navigator.clipboard && window.ClipboardItem) {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          'text/html': new Blob([htmlLink], { type: 'text/html' }),
-          'text/plain': new Blob([markdownLink], { type: 'text/plain' })
-        })
-      ])
-    } else {
-      await navigator.clipboard.writeText(markdownLink)
-    }
-  } catch (err) {
-    const textarea = document.createElement('textarea')
-    textarea.value = markdownLink
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
-  }
-  showToast('已复制可打开的聊天记录链接')
-}
-
 // Auto-update thread title on first message
 async function autoUpdateThreadTitle(text) {
   if (!activeThreadId.value) return
@@ -1367,11 +1393,13 @@ function onScroll() {
   if (!el) return
   const threshold = 80
   userScrolledUp = (el.scrollHeight - el.scrollTop - el.clientHeight) > threshold
+  showScrollBottom.value = userScrolledUp
 }
 function scrollToBottom() {
   const el = messagesArea.value
   if (el) el.scrollTop = el.scrollHeight
   userScrolledUp = false
+  showScrollBottom.value = false
 }
 function scrollToBottomIfNeeded() {
   if (!userScrolledUp) scrollToBottom()
@@ -1387,14 +1415,6 @@ function onCompositionEnd(e) {
   isComposingText.value = false
   onInput(e)
 }
-
-watch(inputText, (val) => {
-  if (val.trim()) {
-    localStorage.setItem(draftKey.value, val)
-  } else {
-    localStorage.removeItem(draftKey.value)
-  }
-})
 
 function onInput(e) {
   scheduleAutoResize(e?.target || inputEl.value)
@@ -1503,6 +1523,43 @@ function triggerAt() {
 }
 
 // === File upload ===
+const MIME_EXTENSIONS = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/svg+xml': 'svg',
+  'application/pdf': 'pdf',
+}
+const FILE_CATEGORY_EXTS = {
+  image: new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']),
+  archive: new Set(['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'xz', 'txz']),
+}
+
+function extensionFromMime(type) {
+  if (!type) return 'bin'
+  return MIME_EXTENSIONS[type] || type.split('/')[1]?.split('+')[0] || 'bin'
+}
+
+function uploadTypeFromFile(file, serverType) {
+  if (serverType === 'image' || serverType === 'archive') return serverType
+  if (file?.type?.startsWith('image/')) return 'image'
+  const ext = (file?.name || '').split('.').pop()?.toLowerCase() || ''
+  if (FILE_CATEGORY_EXTS.image.has(ext)) return 'image'
+  if (FILE_CATEGORY_EXTS.archive.has(ext)) return 'archive'
+  return 'file'
+}
+
+function normalizeUploadFile(file, source, index = 0) {
+  if (!file) return null
+  if (file.name && file.name !== 'image.png') return file
+  const isImage = file.type?.startsWith('image/')
+  const prefix = (isImage ? 'pasted-image' : source).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'file'
+  const ext = extensionFromMime(file.type)
+  return new File([file], `${prefix}-${Date.now()}-${index + 1}.${ext}`, { type: file.type || 'application/octet-stream', lastModified: file.lastModified || Date.now() })
+}
+
 function getEventFiles(e) {
   return Array.from(e?.dataTransfer?.files || []).filter(f => f && f.size >= 0)
 }
@@ -1511,30 +1568,71 @@ function hasDraggedFiles(e) {
   return Array.from(e?.dataTransfer?.types || []).includes('Files')
 }
 
-async function uploadFiles(files, source = '上传') {
-  if (!files?.length) return
-  isUploadingFiles.value = true
-  const token = localStorage.getItem('hub_auth_token')
-  let okCount = 0
-  for (const f of files) {
-    const fd = new FormData()
-    fd.append('file', f, f.name || `${source}-${Date.now()}.${f.type?.split('/')[1] || 'bin'}`)
-    try {
-      const headers = {}
-      if (token) headers['Authorization'] = `Bearer ${token}`
-      const r = await fetch('/admin/upload', { method: 'POST', body: fd, headers })
-      const data = await r.json()
-      if (data.ok) {
-        attachments.value.push({ url: data.url, type: data.type, name: data.name, size: data.size })
-        okCount++
-      } else {
-        showToast(`${source}失败: ` + (data.error || '未知错误'))
-      }
-    } catch (err) {
-      showToast(`${source}失败: ` + err.message)
-    }
+function collectClipboardFiles(clipboardData) {
+  const files = []
+  const seen = new Set()
+  const add = (file) => {
+    if (!file || file.size < 0) return
+    const key = `${file.name || ''}:${file.type || ''}:${file.size || 0}:${file.lastModified || 0}`
+    if (seen.has(key)) return
+    seen.add(key)
+    files.push(file)
   }
-  isUploadingFiles.value = false
+  Array.from(clipboardData?.files || []).forEach(add)
+  Array.from(clipboardData?.items || []).forEach(item => {
+    if (item.kind !== 'file') return
+    try { add(item.getAsFile()) } catch {}
+  })
+  return files
+}
+
+function uploadAuthHeaders() {
+  const token = auth.token || localStorage.getItem('hub_auth_token') || ''
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+async function parseUploadResponse(response) {
+  const text = await response.text().catch(() => '')
+  if (!text) return { ok: false, error: response.ok ? '服务器返回空响应' : `HTTP ${response.status}` }
+  try { return JSON.parse(text) }
+  catch { return { ok: false, error: response.ok ? '响应解析失败' : `HTTP ${response.status}: ${text.slice(0, 120)}` } }
+}
+
+async function uploadFiles(files, source = '上传') {
+  const normalizedFiles = Array.from(files || [])
+    .map((f, idx) => normalizeUploadFile(f, source, idx))
+    .filter(f => f && f.size >= 0)
+  if (!normalizedFiles.length) return
+  isUploadingFiles.value = true
+  let okCount = 0
+  try {
+    for (const f of normalizedFiles) {
+      const fd = new FormData()
+      fd.append('file', f, f.name || `${source}-${Date.now()}.${extensionFromMime(f.type)}`)
+      try {
+        const headers = uploadAuthHeaders()
+        const r = await fetch(new URL('/admin/upload', window.location.href).toString(), { method: 'POST', body: fd, headers, credentials: 'same-origin', cache: 'no-store' })
+        const data = await parseUploadResponse(r)
+        if (r.status === 401) {
+          showToast(`${source}失败: 登录已过期，请刷新后重新登录`)
+          continue
+        }
+        if (r.ok && data.ok) {
+          attachments.value.push({ url: data.url, type: uploadTypeFromFile(f, data.type), name: data.name || f.name, size: data.size })
+          okCount++
+        } else {
+          showToast(`${source}失败: ` + (data.error || `HTTP ${r.status}` || '未知错误'))
+        }
+      } catch (err) {
+        const message = err?.message === 'Failed to fetch' || err?.message === 'fail to fetch'
+          ? '网络连接失败，请检查当前页面地址是否可访问后重试'
+          : (err?.message || '网络错误')
+        showToast(`${source}失败: ${message}`)
+      }
+    }
+  } finally {
+    isUploadingFiles.value = false
+  }
   if (okCount) {
     inputEl.value?.focus()
     showToast(okCount === 1 ? '已添加到输入框' : `已添加 ${okCount} 个文件`)
@@ -1568,17 +1666,27 @@ async function onDropFiles(e) {
 }
 
 async function onPaste(e) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  const files = []
-  for (const item of items) {
-    if (item.kind === 'file') {
-      const file = item.getAsFile()
-      if (file) files.push(file)
-    }
-  }
+  const files = collectClipboardFiles(e.clipboardData)
   if (!files.length) return
-  // Prevent default paste of image as text
+  // Prevent default paste of binary/image content as text or broken file path.
+  e.preventDefault()
+  await uploadFiles(files, '粘贴上传')
+}
+
+function isEditableTarget(target) {
+  if (!target) return false
+  const tag = target.tagName?.toLowerCase?.()
+  return tag === 'input' || tag === 'textarea' || target.isContentEditable
+}
+
+async function onWindowPaste(e) {
+  if (e.defaultPrevented) return
+  // Text inputs keep their normal paste behavior. The chat textarea has its own
+  // @paste handler, but this fallback lets users paste screenshots/files while
+  // focus is on the message area or another non-editable part of the chat.
+  if (isEditableTarget(e.target)) return
+  const files = collectClipboardFiles(e.clipboardData)
+  if (!files.length) return
   e.preventDefault()
   await uploadFiles(files, '粘贴上传')
 }
@@ -1648,7 +1756,6 @@ async function send() {
 
   inputText.value = ''
   attachments.value = []
-  localStorage.removeItem(draftKey.value)
   if (inputEl.value) inputEl.value.style.height = 'auto'
 
   // Auto-interrupt: keep the old stream in-place and mark it interrupted so the
@@ -1747,6 +1854,100 @@ function showToast(msg) {
   setTimeout(() => t.remove(), 2000)
 }
 
+function safeShareFilename(name) {
+  return String(name || 'chat')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'chat'
+}
+
+function renderShareText(text) {
+  return escapeHtml(text || '')
+    .replace(/https?:\/\/[^\s<]+/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer">查看链接</a>`)
+    .replace(/\n/g, '<br>')
+}
+
+function buildShareHtml(roomTitle, rows) {
+  const generatedAt = new Date().toLocaleString()
+  const messagesHtml = rows.map(m => {
+    const cls = m.self ? 'msg-group self' : (m.event ? 'msg-group event' : 'msg-group')
+    const bubbleCls = m.event ? 'msg event' : 'msg'
+    const sender = escapeHtml(m.senderName || '未知')
+    const time = escapeHtml(m.time || '')
+    return `<article class="${cls}"><div class="${bubbleCls}">${!m.event ? `<div class="sender-name">${sender}</div>` : ''}<div class="msg-text">${renderShareText(m.text)}</div>${!m.event ? `<div class="msg-meta-row"><span>${sender}</span><span>${time}</span></div>` : ''}</div></article>`
+  }).join('')
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(roomTitle)} - 聊天记录</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f7f3ea; --surface:#fffaf1; --surface2:#f2eadc; --text:#1f2933; --text-dim:#6b7280; --text-faint:#9ca3af; --border:rgba(45,106,79,.18); --accent:#2d6a4f; --accent-glow:rgba(45,106,79,.18); --radius-lg:18px; --shadow-sm:0 1px 2px rgba(0,0,0,.05); }
+    @media (prefers-color-scheme: dark) { :root { --bg:#11140f; --surface:#1a211b; --surface2:#222b24; --text:#f3f5ef; --text-dim:#b7c0b4; --text-faint:#879083; --border:rgba(232,240,235,.16); --accent:#7fb096; --accent-glow:rgba(127,176,150,.22); } }
+    * { box-sizing:border-box; } html, body { margin:0; min-height:100%; } body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); }
+    .shell { min-height:100vh; display:flex; flex-direction:column; } header { position:sticky; top:0; z-index:2; padding:14px 20px; background:var(--surface); border-bottom:1px solid var(--border); box-shadow:var(--shadow-sm); }
+    h1 { margin:0; font-size:17px; line-height:1.3; overflow-wrap:anywhere; } .meta { margin-top:6px; color:var(--text-dim); font-size:12px; }
+    main { flex:1; width:100%; max-width:980px; margin:0 auto; padding:16px 20px 24px; display:flex; flex-direction:column; gap:6px; }
+    .msg-group { display:flex; flex-direction:column; gap:2px; } .msg { max-width:78%; padding:10px 14px; border-radius:var(--radius-lg); font-size:14.5px; line-height:1.6; word-break:break-word; overflow-wrap:anywhere; }
+    .msg-group:not(.self) .msg { align-self:flex-start; background:var(--surface); border:1px solid var(--border); color:var(--text); box-shadow:var(--shadow-sm); }
+    .msg-group.self .msg { align-self:flex-end; background:var(--accent); border:1px solid transparent; color:white; box-shadow:0 1px 2px var(--accent-glow); }
+    .msg.event { align-self:center; max-width:78%; background:rgba(217,119,6,.08); color:var(--text-dim); border:1px solid rgba(217,119,6,.18); box-shadow:none; border-radius:999px; padding:6px 12px; font-size:12.5px; text-align:center; }
+    .sender-name { font-size:12px; color:var(--accent); font-weight:600; margin-bottom:4px; } .self .sender-name { color:rgba(255,255,255,.85); }
+    .msg-text { white-space:normal; overflow-wrap:anywhere; } .msg-text a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; word-break:break-all; } .self .msg-text a { color:#bbf7d0; }
+    .msg-meta-row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; font-size:11px; color:var(--text-faint); } .self .msg-meta-row { color:rgba(255,255,255,.7); }
+    .empty { color:var(--text-dim); text-align:center; padding:36px 4px; }
+    @media (max-width:640px) { header { padding:12px 14px; } main { padding:12px 10px 18px; } .msg { max-width:88%; padding:9px 12px; font-size:14px; } .msg.event { max-width:88%; } h1 { font-size:15px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header><h1>${escapeHtml(roomTitle)}</h1><div class="meta">${rows.length} 条消息 · 导出时间：${escapeHtml(generatedAt)} · 离线 HTML 聊天记录</div></header>
+    <main>${messagesHtml || '<div class="empty">暂无聊天记录</div>'}</main>
+  </div>
+</body>
+</html>`
+}
+
+async function shareChatContent() {
+  const rows = messages.value
+    .filter(m => m && m.text && !String(m.id).startsWith('tmp-') && !String(m.id).startsWith('stream-'))
+    .map(m => ({
+      senderName: m.sender_name || (m.sender_id === 'user' ? '我' : m.sender_id || '未知'),
+      time: m.created_at ? formatMsgTime(m.created_at) : (m.time || ''),
+      text: m.text || '',
+      self: m.sender_id === 'user',
+      event: m.sender_id === 'system' || !!m.event,
+    }))
+  if (!rows.length) {
+    showToast('当前没有可分享的聊天内容')
+    return
+  }
+  const html = buildShareHtml(title.value || '聊天记录', rows)
+  const date = new Date().toISOString().slice(0, 10)
+  const filename = `${safeShareFilename(title.value)}-聊天记录-${date}.html`
+  const file = new File([html], filename, { type: 'text/html;charset=utf-8' })
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: `${title.value || '聊天记录'} - 聊天记录` })
+      showToast('已打开系统分享')
+      return
+    } catch (err) {
+      if (err?.name === 'AbortError') return
+    }
+  }
+  const url = URL.createObjectURL(file)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+  showToast('已生成聊天记录 HTML 文件')
+}
+
 async function onMembersChanged() {
   // refresh conversation list so room.members reflects latest
   await loadConversations()
@@ -1764,6 +1965,13 @@ async function respondApproval(decision) {
   if (!pendingApproval.value) return
   const id = pendingApproval.value.id
   pendingApproval.value = null
+  await api('POST', `/admin/approvals/${id}`, { decision })
+}
+
+async function respondSkillApproval(decision) {
+  if (!pendingSkillApproval.value) return
+  const id = pendingSkillApproval.value.id
+  pendingSkillApproval.value = null
   await api('POST', `/admin/approvals/${id}`, { decision })
 }
 
@@ -1813,6 +2021,13 @@ function handleWS(msg) {
       description: msg.description,
       agentName: msg.agent_name,
     }
+  } else if (msg.type === 'skill_approval_request' && msg.room_id === props.room.id) {
+    pendingSkillApproval.value = {
+      id: msg.approval_id,
+      action: msg.action,
+      agentName: msg.agent_name,
+      details: msg.details || {},
+    }
   } else if (msg.type === 'message_deleted' && msg.room_id === props.room.id) {
     // Remove deleted message from local list
     const msgThread = msg.thread_id || null
@@ -1822,18 +2037,25 @@ function handleWS(msg) {
   }
 }
 
+function onShortcutViewportResize() {
+  shortcutViewportTick.value++
+  clampShortcutPosition()
+}
+
 onMounted(() => {
+  try {
+    const savedShortcutPosition = JSON.parse(localStorage.getItem('shortcut_floating_pos') || 'null')
+    if (savedShortcutPosition && Number.isFinite(savedShortcutPosition.x) && Number.isFinite(savedShortcutPosition.y)) {
+      shortcutPosition.value = savedShortcutPosition
+    }
+  } catch {}
+  clampShortcutPosition()
+  window.addEventListener('resize', onShortcutViewportResize)
+  window.addEventListener('paste', onWindowPaste)
   clearUnread(props.room.id)
   currentRoomId.value = props.room.id
-  loadShortcutPos()
-  window.addEventListener('resize', clampShortcutPos)
-  const savedDraft = localStorage.getItem(draftKey.value)
-  if (savedDraft) inputText.value = savedDraft
   fetchMessages({ forceScroll: true })
   fetchThreads()
-  pollTimer = setInterval(() => {
-    if (!hasActiveStreamInView.value) fetchMessages({ keepPosition: true })
-  }, 3000)
   ws.onMessage(handleWS)
   // If there are already active streams for this room (e.g. from WS reconnect before mount),
   // scroll to bottom to show the generating bubble
@@ -1844,13 +2066,342 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  clearInterval(pollTimer)
-  cleanupShortcutDragListeners()
-  window.removeEventListener('resize', clampShortcutPos)
+  window.removeEventListener('resize', onShortcutViewportResize)
+  window.removeEventListener('paste', onWindowPaste)
+  document.removeEventListener('pointermove', onShortcutPointerMove)
   if (resizeRaf) cancelAnimationFrame(resizeRaf)
+  closeMessageContextMenu()
   currentRoomId.value = null
   ws.offMessage(handleWS)
 })
 
 // Note: room switching is handled by :key on <ChatView> which destroys/recreates the component
 </script>
+
+<style scoped>
+.shortcut-trigger-btn {
+  position: fixed;
+  z-index: 10011;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--accent);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+  transition: all 0.15s ease;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+.shortcut-trigger-btn.dragging,
+.shortcut-trigger-btn:active {
+  cursor: grabbing;
+}
+.shortcut-trigger-btn:hover,
+.shortcut-trigger-btn.active {
+  background: color-mix(in srgb, var(--accent-soft) 40%, var(--surface));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+.shortcut-trigger-btn svg {
+  width: 15px;
+  height: 15px;
+}
+.shortcut-card {
+  position: fixed;
+  width: min(440px, calc(100vw - 28px));
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  z-index: 10012;
+  animation: slideUp 0.16s ease;
+  overflow: auto;
+}
+.shortcut-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  padding: 0 2px 8px;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+.shortcut-drag-hint {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.shortcut-close {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim, #888);
+  font-size: 18px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 2px;
+}
+.shortcut-close:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+.shortcut-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 8px;
+}
+.shortcut-card-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.shortcut-card-item:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg));
+  transform: translateY(-1px);
+}
+.shortcut-card-item svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+.shortcut-card-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 767px) {
+  .shortcut-trigger-btn {
+    height: 30px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+  .shortcut-card {
+    width: min(360px, calc(100vw - 20px));
+  }
+  .shortcut-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.scroll-bottom-btn {
+  position: fixed;
+  right: 18px;
+  bottom: 86px;
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: var(--surface);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10020;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.scroll-bottom-btn:hover {
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface));
+  color: var(--accent);
+}
+.scroll-bottom-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.thinking-bubble {
+  margin: 6px 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.07);
+  color: var(--text-dim);
+  overflow: hidden;
+}
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+}
+.thinking-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--text-dim);
+  opacity: .55;
+}
+.thinking-dot.active {
+  background: var(--accent);
+  opacity: 1;
+  animation: thinkingPulse 1.2s ease-in-out infinite;
+}
+.thinking-label {
+  font-weight: 600;
+  color: var(--text);
+}
+.thinking-count {
+  margin-left: auto;
+  font-size: 11px;
+  opacity: .75;
+}
+.thinking-chevron {
+  width: 14px;
+  height: 14px;
+  transition: transform .18s ease;
+}
+.thinking-bubble:not(.collapsed) .thinking-chevron {
+  transform: rotate(180deg);
+}
+.thinking-steps {
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  padding: 4px 10px 9px;
+}
+.thinking-step {
+  display: flex;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.thinking-step-stage {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 600;
+}
+.thinking-step.error .thinking-step-stage {
+  color: #ef4444;
+}
+.thinking-step-content {
+  min-width: 0;
+  word-break: break-word;
+}
+.process-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.process-tool-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.05);
+  padding: 8px 10px;
+}
+.process-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.process-tool-status {
+  color: var(--accent);
+}
+.process-tool-card.error .process-tool-status {
+  color: #ef4444;
+}
+.process-tool-name {
+  color: var(--text);
+}
+.process-tool-summary,
+.process-tool-result {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+}
+.process-tool-result {
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.09);
+}
+.process-tool-result.error {
+  color: #ef4444;
+}
+.msg-model {
+  font-size: 10px;
+  color: var(--text-faint);
+  opacity: .75;
+  background: rgba(128, 128, 128, 0.15);
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.msg-group.self .msg .msg-model {
+  color: rgba(255, 255, 255, 0.7);
+}
+.skill-approval-dialog {
+  max-width: 620px;
+}
+.skill-approval-content {
+  padding: 12px 0;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.skill-approval-field {
+  margin-bottom: 12px;
+}
+.skill-approval-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.skill-approval-name {
+  font-weight: 600;
+  color: var(--accent);
+}
+.skill-approval-content-view {
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 250px;
+  overflow-y: auto;
+  color: var(--text);
+}
+@keyframes thinkingPulse {
+  0%, 100% { transform: scale(1); opacity: .75; }
+  50% { transform: scale(1.35); opacity: 1; }
+}
+</style>
