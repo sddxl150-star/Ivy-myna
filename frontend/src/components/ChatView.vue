@@ -331,7 +331,7 @@
         </div>
       </div>
       <!-- Mention popup -->
-      <div v-if="showMentions && mentionCandidates.length" class="mention-popup">
+      <div v-if="showMentions && mentionCandidates.length" class="mention-popup" @click.stop>
         <div
           v-for="(c, idx) in mentionCandidates"
           :key="c.id"
@@ -390,7 +390,7 @@
       <input ref="fileInput" type="file" multiple style="display:none" @change="onFiles">
       <input ref="imageInput" type="file" multiple accept="image/*" style="display:none" @change="onFiles">
 
-      <button class="at-btn" @click="triggerAt" title="@提及">
+      <button class="at-btn" @click.stop="triggerAt" title="@提及">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0V12a10 10 0 1 0-3.92 7.94"/></svg>
       </button>
 
@@ -901,11 +901,11 @@ const mentionCandidates = computed(() => {
   const showAll = isGroup && pool.filter(m => m.id !== 'system').length > 1
   const allOption = { id: '__all__', name: '全部', description: '通知所有智能体' }
   const q = mentionQuery.value.toLowerCase()
-  if (!q) return [...(showAll ? [allOption] : []), ...pool.slice(0, 8)]
+  if (!q) return [...(showAll ? [allOption] : []), ...pool]
   if (showAll && ('全部'.includes(q) || 'all'.includes(q))) {
-    return [allOption, ...pool.filter(m => (m.name || '').toLowerCase().includes(q)).slice(0, 7)]
+    return [allOption, ...pool.filter(m => (m.name || '').toLowerCase().includes(q))]
   }
-  return pool.filter(m => (m.name || '').toLowerCase().includes(q)).slice(0, 8)
+  return pool.filter(m => (m.name || '').toLowerCase().includes(q))
 })
 
 watch(mentionCandidates, (list) => {
@@ -1470,6 +1470,13 @@ function closeMentions() {
   mentionStartPos.value = -1
 }
 
+function onMentionOutsideClick(e) {
+  if (!showMentions.value) return
+  const target = e.target
+  if (target?.closest?.('.mention-popup, .at-btn')) return
+  closeMentions()
+}
+
 const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
 
 function onEnterKey(e) {
@@ -1513,6 +1520,10 @@ function onTab() {
 function triggerAt() {
   const el = inputEl.value
   if (!el) return
+  if (showMentions.value) {
+    closeMentions()
+    return
+  }
   el.focus()
   const pos = el.selectionStart || inputText.value.length
   inputText.value = inputText.value.slice(0, pos) + '@' + inputText.value.slice(pos)
@@ -2057,6 +2068,7 @@ onMounted(() => {
   fetchMessages({ forceScroll: true })
   fetchThreads()
   ws.onMessage(handleWS)
+  document.addEventListener('click', onMentionOutsideClick)
   // If there are already active streams for this room (e.g. from WS reconnect before mount),
   // scroll to bottom to show the generating bubble
   nextTick(() => {
@@ -2073,6 +2085,7 @@ onUnmounted(() => {
   closeMessageContextMenu()
   currentRoomId.value = null
   ws.offMessage(handleWS)
+  document.removeEventListener('click', onMentionOutsideClick)
 })
 
 // Note: room switching is handled by :key on <ChatView> which destroys/recreates the component
