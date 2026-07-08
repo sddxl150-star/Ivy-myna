@@ -13,7 +13,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span class="thread-toggle-count" v-if="threads.length > 0">{{ threads.length + 1 }}</span>
       </button>
-      <button v-if="type === 'group'" class="share-room-btn" @click="shareRoom" title="分享聊天记录" aria-label="分享聊天记录">
+      <button v-if="type === 'group'" class="share-room-btn" @click="shareRoom" title="导出聊天记录 HTML" aria-label="导出聊天记录 HTML">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.07 0l2.83-2.83a5 5 0 0 0-7.07-7.07L11 4.93"/><path d="M14 11a5 5 0 0 0-7.07 0L4.1 13.83a5 5 0 0 0 7.07 7.07L13 19.07"/></svg>
       </button>
       <button v-if="type === 'group'" class="more-btn" :class="{ active: showSettings }" @click="showSettings = !showSettings" :title="showSettings ? '返回聊天' : '群聊信息'">
@@ -1235,35 +1235,98 @@ async function copyMsg(msg) {
   }
 }
 
+function safeShareFilename(name) {
+  return String(name || 'chat')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'chat'
+}
+
+function renderShareText(text) {
+  return escapeHtml(text || '')
+    .replace(/https?:\/\/[^\s<]+/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer">查看链接</a>`)
+    .replace(/\n/g, '<br>')
+}
+
+function buildShareHtml(roomTitle, rows) {
+  const generatedAt = new Date().toLocaleString()
+  const messagesHtml = rows.map(m => {
+    const cls = m.self ? 'msg-group self' : (m.event ? 'msg-group event' : 'msg-group')
+    const bubbleCls = m.event ? 'msg event' : 'msg'
+    const sender = escapeHtml(m.senderName || '未知')
+    const time = escapeHtml(m.time || '')
+    return `<article class="${cls}"><div class="${bubbleCls}">${!m.event ? `<div class="sender-name">${sender}</div>` : ''}<div class="msg-text">${renderShareText(m.text)}</div>${!m.event ? `<div class="msg-meta-row"><span>${sender}</span><span>${time}</span></div>` : ''}</div></article>`
+  }).join('')
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(roomTitle)} - 聊天记录</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f7f3ea; --surface:#fffaf1; --surface2:#f2eadc; --text:#1f2933; --text-dim:#6b7280; --text-faint:#9ca3af; --border:rgba(45,106,79,.18); --accent:#2d6a4f; --accent-glow:rgba(45,106,79,.18); --radius-lg:18px; --shadow-sm:0 1px 2px rgba(0,0,0,.05); }
+    @media (prefers-color-scheme: dark) { :root { --bg:#11140f; --surface:#1a211b; --surface2:#222b24; --text:#f3f5ef; --text-dim:#b7c0b4; --text-faint:#879083; --border:rgba(232,240,235,.16); --accent:#7fb096; --accent-glow:rgba(127,176,150,.22); } }
+    * { box-sizing:border-box; } html, body { margin:0; min-height:100%; } body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); }
+    .shell { min-height:100vh; display:flex; flex-direction:column; } header { position:sticky; top:0; z-index:2; padding:14px 20px; background:var(--surface); border-bottom:1px solid var(--border); box-shadow:var(--shadow-sm); }
+    h1 { margin:0; font-size:17px; line-height:1.3; overflow-wrap:anywhere; } .meta { margin-top:6px; color:var(--text-dim); font-size:12px; }
+    main { flex:1; width:100%; max-width:980px; margin:0 auto; padding:16px 20px 24px; display:flex; flex-direction:column; gap:6px; }
+    .msg-group { display:flex; flex-direction:column; gap:2px; } .msg { max-width:78%; padding:10px 14px; border-radius:var(--radius-lg); font-size:14.5px; line-height:1.6; word-break:break-word; overflow-wrap:anywhere; }
+    .msg-group:not(.self) .msg { align-self:flex-start; background:var(--surface); border:1px solid var(--border); color:var(--text); box-shadow:var(--shadow-sm); }
+    .msg-group.self .msg { align-self:flex-end; background:var(--accent); border:1px solid transparent; color:white; box-shadow:0 1px 2px var(--accent-glow); }
+    .msg.event { align-self:center; max-width:78%; background:rgba(217,119,6,.08); color:var(--text-dim); border:1px solid rgba(217,119,6,.18); box-shadow:none; border-radius:999px; padding:6px 12px; font-size:12.5px; text-align:center; }
+    .sender-name { font-size:12px; color:var(--accent); font-weight:600; margin-bottom:4px; } .self .sender-name { color:rgba(255,255,255,.85); }
+    .msg-text { white-space:normal; overflow-wrap:anywhere; } .msg-text a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; word-break:break-all; } .self .msg-text a { color:#bbf7d0; }
+    .msg-meta-row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; font-size:11px; color:var(--text-faint); } .self .msg-meta-row { color:rgba(255,255,255,.7); }
+    .empty { color:var(--text-dim); text-align:center; padding:36px 4px; }
+    @media (max-width:640px) { header { padding:12px 14px; } main { padding:12px 10px 18px; } .msg { max-width:88%; padding:9px 12px; font-size:14px; } .msg.event { max-width:88%; } h1 { font-size:15px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header><h1>${escapeHtml(roomTitle)}</h1><div class="meta">${rows.length} 条消息 · 导出时间：${escapeHtml(generatedAt)} · 离线 HTML 聊天记录</div></header>
+    <main>${messagesHtml || '<div class="empty">暂无聊天记录</div>'}</main>
+  </div>
+</body>
+</html>`
+}
+
 async function shareRoom() {
-  const relativeUrl = `/share/${encodeURIComponent(props.room.id)}`
-  const absoluteUrl = new URL(relativeUrl, window.location.origin).href
-  const label = '查看聊天记录'
-  const markdownLink = `[${label}](${absoluteUrl})`
-  const safeAbsoluteUrl = absoluteUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-  const htmlLink = `<a href="${safeAbsoluteUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`
-  try {
-    if (navigator.clipboard && window.ClipboardItem) {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          'text/html': new Blob([htmlLink], { type: 'text/html' }),
-          'text/plain': new Blob([markdownLink], { type: 'text/plain' })
-        })
-      ])
-    } else {
-      await navigator.clipboard.writeText(markdownLink)
-    }
-  } catch (err) {
-    const textarea = document.createElement('textarea')
-    textarea.value = markdownLink
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
+  const rows = messages.value
+    .filter(m => m && m.text && !String(m.id).startsWith('tmp-') && !String(m.id).startsWith('stream-'))
+    .map(m => ({
+      senderName: m.sender_name || (m.sender_id === 'user' ? '我' : m.sender_id || '未知'),
+      time: m.created_at ? formatMsgTime(m.created_at) : (m.time || ''),
+      text: m.text || '',
+      self: m.sender_id === 'user',
+      event: m.sender_id === 'system' || !!m.event,
+    }))
+  if (!rows.length) {
+    showToast('当前没有可分享的聊天内容')
+    return
   }
-  showToast('已复制可打开的聊天记录链接')
+  const html = buildShareHtml(title.value || '聊天记录', rows)
+  const date = new Date().toISOString().slice(0, 10)
+  const filename = `${safeShareFilename(title.value)}-聊天记录-${date}.html`
+  const file = new File([html], filename, { type: 'text/html;charset=utf-8' })
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: `${title.value || '聊天记录'} - 聊天记录` })
+      showToast('已打开系统分享')
+      return
+    } catch (err) {
+      if (err?.name === 'AbortError') return
+    }
+  }
+  const url = URL.createObjectURL(file)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+  showToast('已生成聊天记录 HTML 文件')
 }
 
 // Auto-update thread title on first message
