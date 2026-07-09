@@ -547,6 +547,36 @@ function isSkillStatusMessage(msg) {
 }
 
 function toolLabel(name) { return TOOL_LABELS[name] || cleanText(name) || '工具' }
+
+function compactModelBadge(value) {
+  let text = cleanText(value)
+  if (!text) return ''
+  const parts = text.split('/').map(x => x.trim()).filter(Boolean)
+  let provider = ''
+  let model = text
+  if (parts.length >= 2) {
+    provider = parts[0]
+    model = parts.slice(1).join('/')
+  }
+  const providerLow = provider.toLowerCase()
+  if (providerLow.includes('qwe') || providerLow.includes('qwen') || providerLow === 'qw') provider = 'qwe'
+  else if (providerLow.includes('openai')) provider = 'openai'
+  else if (providerLow.includes('claude') || providerLow.includes('anthropic')) provider = 'claude'
+  else if (providerLow.includes('gemini') || providerLow.includes('google')) provider = 'gemini'
+  else if (providerLow.includes('deepseek')) provider = 'deepseek'
+  else provider = provider ? provider.split(/[\s-]+/)[0].toLowerCase() : ''
+  model = model.toLowerCase()
+    .replace(/^qwe\//, '')
+    .replace(/^qwen\//, '')
+    .replace(/^openai\//, '')
+    .replace(/^claude\//, '')
+    .replace(/^gemini\//, '')
+    .replace(/^deepseek\//, '')
+    .replace(/gpt[-_]/g, 'gpt')
+    .replace(/qwen[-_]/g, 'qwen')
+    .replace(/claude[-_]/g, 'claude')
+  return provider && model && provider !== model ? `${provider}/${model}` : (model || provider)
+}
 function toolExpandKey(msg, partIndex = null) {
   const sid = String(msg.id).startsWith('stream-') ? msg.id.replace('stream-', '') : `saved-${msg.id}`
   return partIndex === null ? sid : `${sid}-part-${partIndex}`
@@ -1098,7 +1128,7 @@ const messageGroups = computed(() => {
         }
         if (meta.model || meta.model_name || meta.actual_model) {
           modelInfo = meta.model || meta.actual_model
-          modelNameInfo = meta.model_name || meta.actual_model || meta.model
+          modelNameInfo = compactModelBadge(meta.model_name || meta.actual_model || meta.model)
         }
       } catch {}
     }

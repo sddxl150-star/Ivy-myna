@@ -1765,9 +1765,38 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
         configured_model_name = model_config.get("model", "") if model_config else ""
         configured_provider_name = model_config.get("name", "") if model_config else ""
 
+        def _abbr_provider(label: str) -> str:
+            value = (label or "").strip()
+            low = value.lower()
+            if "qwe" in low or "qwen" in low or "qw" == low:
+                return "qwe"
+            if "openai" in low:
+                return "openai"
+            if "claude" in low or "anthropic" in low:
+                return "claude"
+            if "gemini" in low or "google" in low:
+                return "gemini"
+            if "deepseek" in low:
+                return "deepseek"
+            return value.split()[0].split("-")[0].lower() if value else ""
+
+        def _abbr_model(label: str) -> str:
+            value = (label or "").strip()
+            low = value.lower()
+            for prefix in ("qwe/", "qwen/", "openai/", "claude/", "gemini/", "deepseek/"):
+                if low.startswith(prefix):
+                    value = value.split("/", 1)[1]
+                    low = value.lower()
+                    break
+            low = low.replace("gpt-", "gpt")
+            low = low.replace("gpt_", "gpt")
+            low = low.replace("qwen-", "qwen")
+            low = low.replace("claude-", "claude")
+            return low
+
         def _display_model_name(model_name: str | None = None) -> str:
-            concrete_model = (model_name or configured_model_name or "").strip()
-            provider_label = (configured_provider_name or "").strip()
+            concrete_model = _abbr_model(model_name or configured_model_name or "")
+            provider_label = _abbr_provider(configured_provider_name or "")
             if provider_label and concrete_model and provider_label.lower() != concrete_model.lower():
                 return f"{provider_label}/{concrete_model}"
             return concrete_model or provider_label
