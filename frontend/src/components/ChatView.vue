@@ -1048,12 +1048,17 @@ function renderMd(text) {
     // Sanitize with DOMPurify to prevent XSS while keeping rich content
     html = DOMPurify.sanitize(html, {
       ALLOWED_TAGS: ['a','b','i','em','strong','code','pre','p','br','ul','ol','li','h1','h2','h3','h4','h5','h6','table','thead','tbody','tr','th','td','div','span','img','video','source','blockquote','details','summary','del','ins','sup','sub','hr','ruby','rt','rp'],
-      ALLOWED_ATTR: ['href','target','style','class','id','src','alt','title','controls','download','onclick','colspan','rowspan','width','height','align','valign'],
+      ALLOWED_ATTR: ['href','target','rel','style','class','id','src','alt','title','controls','download','onclick','colspan','rowspan','width','height','align','valign'],
       ALLOW_DATA_ATTR: false,
       FORBID_TAGS: ['script','style','iframe','object','embed','form','input','textarea','select','button','link','meta','noscript'],
       FORBID_ATTR: ['onerror','onload','onmouseover','onfocus','onblur','onsubmit','onchange','formaction'],
     })
-    return html
+    const doc = new DOMParser().parseFromString(html, 'text/html')
+    doc.querySelectorAll('a[href]').forEach(a => {
+      a.setAttribute('target', '_blank')
+      a.setAttribute('rel', 'noopener noreferrer')
+    })
+    return doc.body.innerHTML
   } catch { return escapeHtml(text) }
 }
 
