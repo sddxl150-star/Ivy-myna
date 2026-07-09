@@ -5,6 +5,8 @@ import os
 import json
 import asyncio
 import re
+import threading
+import time
 from datetime import datetime
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
@@ -16,6 +18,46 @@ router = APIRouter()
 
 MENTION_RE = r"@([^\s@,，.。;；:：!！?？]+)"
 RESERVED_AGENT_IDS = {"system", "user", "__system__", "__all__"}
+
+# TRAE experience account message limit
+TRAE_MSG_LIMIT_PER_USER = 2
+TRAE_MSG_TRACKER_KEY = "traetest_msg_tracker"
+TRAE_DEMO_GITHUB_URL = "https://github.com/uskyu/Myna"
+TRAE_MSG_LIMIT_TIP = (
+    "为了控制公共 Demo 的 token 消耗，体验账号每天仅开放 10 个体验名额，"
+    "每位体验用户只能体验 1-2 个问题/任务。深度体验欢迎点击 GitHub 链接自行部署："
+    f"{TRAE_DEMO_GITHUB_URL} ，有问题可联系作者一起调整。"
+)
+_msg_lock = threading.Lock()
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "0.0.0.0"
+
+
+def _check_traetest_message_limit(db, ip: str) -> tuple[bool, str]:
+    with _msg_lock:
+        raw = db.get_hub_setting(TRAE_MSG_TRACKER_KEY) or "{}"
+        try:
+            tracker = json.loads(raw)
+        except Exception:
+            tracker = {}
+        today = time.strftime("%Y-%m-%d")
+        if tracker.get("date") != today or not isinstance(tracker.get("ip_counts"), dict):
+            tracker = {"date": today, "ip_counts": {}}
+        cur = tracker["ip_counts"].get(ip, 0)
+        if cur >= TRAE_MSG_LIMIT_PER_USER:
+            return False, TRAE_MSG_LIMIT_TIP
+        tracker["ip_counts"][ip] = cur + 1
+        db.set_hub_setting(TRAE_MSG_TRACKER_KEY, json.dumps(tracker))
+        return True, ""
+
+
 SKILL_CREATE_RE = re.compile(
     r"^(?:请|麻烦|帮我)?\s*(?:(?:给|为|帮)\s*@?[^\s@,，。；;:：!！?？]{2,32}\s*)?"
     r"(?:创建|新建|保存|学习|记录|加入|添加)\s*(?:一个|一条|本次|这个|此)?\s*(?:skill|技能)\s*(?=[：:《\"“'])",
@@ -137,6 +179,15 @@ def _handle_natural_language_skill_create(db, room_id: str, text: str, mentions:
     system_message = db.create_message(room_id, "system", status_text, "markdown", None, [], thread_id=thread_id)
     return {"ok": True, "message": system_message, "created": created}
 
+
+
+
+def default_single_agent_mentions(db, room_id: str, mentions: list | None) -> list:
+    mentions = list(mentions or [])
+    if mentions:
+        return mentions
+    real_members = [m for m in db.get_room_members(room_id) if is_real_agent(m)]
+    return [real_members[0]["id"]] if len(real_members) == 1 else mentions
 
 def resolve_real_mentions(db, text: str, mentions: list | None = None) -> list:
     agents = {a["id"]: a for a in db.list_agents() if is_real_agent(a)}
@@ -558,6 +609,8 @@ async def send_message(room_id: str, request: Request):
 
     room = db.get_room(room_id)
     room_type = room["type"] if room else "group"
+    if room_type == "group":
+        mentions = default_single_agent_mentions(db, room_id, mentions)
 
     await _interrupt_matching_streams(ws_manager, room_id, mentions)
 
@@ -574,6 +627,15 @@ async def send_message(room_id: str, request: Request):
 
     if is_low_value_collaboration_ack(text):
         return {"ok": True, "result": message, "skipped_ai": "low_value_collaboration_ack"}
+
+    # TRAE experience account message limit
+    if tenant_id == "traetest":
+        ip = _get_client_ip(request)
+        allowed, limit_msg = _check_traetest_message_limit(db, ip)
+        if not allowed:
+            limit_sys_msg = db.create_message(room_id, "system", f"⚠️ {limit_msg}")
+            await ws_manager.notify_ui({"type": "new_message", "room_id": room_id, "message": limit_sys_msg})
+            return {"ok": True, "result": message, "limit_reached": True}
 
     # Trigger AI asynchronously
     from ai_engine import process_message
@@ -995,6 +1057,8 @@ async def send_thread_message(thread_id: str, request: Request):
 
     room = db.get_room(thread["room_id"])
     room_type = room["type"] if room else "group"
+    if room_type == "group":
+        mentions = default_single_agent_mentions(db, thread["room_id"], mentions)
 
     await _interrupt_matching_streams(ws_manager, thread["room_id"], mentions, thread_id)
 
@@ -1008,6 +1072,15 @@ async def send_thread_message(thread_id: str, request: Request):
             error_message = db.create_message(thread["room_id"], "system", f"⚠️ 技能创建失败：{skill_result.get('error', '未知错误')}", thread_id=thread_id)
             await ws_manager.notify_ui({"type": "new_message", "room_id": thread["room_id"], "message": error_message, "thread_id": thread_id})
         return {"ok": True, "result": message, "skill_result": skill_result}
+
+    # TRAE experience account message limit
+    if tenant_id_for_request(request) == "traetest":
+        ip = _get_client_ip(request)
+        allowed, limit_msg = _check_traetest_message_limit(db, ip)
+        if not allowed:
+            limit_sys_msg = db.create_message(thread["room_id"], "system", f"⚠️ {limit_msg}", thread_id=thread_id)
+            await ws_manager.notify_ui({"type": "new_message", "room_id": thread["room_id"], "message": limit_sys_msg, "thread_id": thread_id})
+            return {"ok": True, "result": message, "limit_reached": True}
 
     # Trigger AI
     from ai_engine import process_message

@@ -1663,10 +1663,9 @@ async def process_message(db, ws_manager, room_id: str, sender_id: str, text: st
                         except:
                             pass
     elif sender_id == "user":
-        # In group rooms, an unmentioned user message should fan out to the
-        # room's real AI members. Otherwise ordinary text/image messages in a
-        # one-agent group are persisted but never reach the agent.
-        responding_agents = [m for m in members if m["id"] not in ("user", "system")]
+        real_members = [m for m in members if m["id"] not in ("user", "system")]
+        if len(real_members) == 1:
+            responding_agents = real_members
 
     if not responding_agents:
         return
