@@ -1005,6 +1005,19 @@ function sortChatMessages(list) {
   ))
 }
 
+
+function normalizeDisplayMathBlocks(text) {
+  if (!text) return text
+  return text.replace(/(^|\n)\s*\[\s*\n([\s\S]*?)\n\s*\]\s*(?=\n|$)/g, (match, prefix, body) => {
+    const lines = body.split('\n').map(line => line.trim()).filter(Boolean)
+    if (!lines.length || lines.length > 4) return match
+    const content = lines.join(' ')
+    const looksLikeFormula = /[=÷×+\-*/%≈]|\d/.test(content) && !/^https?:\/\//i.test(content)
+    if (!looksLikeFormula) return match
+    return `${prefix}<div class="formula-block">${escapeHtml(content)}</div>\n`
+  })
+}
+
 function renderMd(text) {
   if (!text) return ''
   try {
@@ -1035,7 +1048,9 @@ function renderMd(text) {
 
     // Convert MEDIA:/path/to/file to displayable content
     // Supports: MEDIA:/path, MEDIA:`/path`, **MEDIA:** `/path`
-    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\n`]*?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|pdf|html?|zip|tar|gz|7z|rar|docx?|xlsx?|pptx?|txt|md|json|csv|sql))`?/gi, (match, filePath) => {
+    let processed = normalizeDisplayMathBlocks(text)
+
+    processed = processed.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\n`]*?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|pdf|html?|zip|tar|gz|7z|rar|docx?|xlsx?|pptx?|txt|md|json|csv|sql))`?/gi, (match, filePath) => {
       const cleanPath = filePath.trim()
       const ext = cleanPath.split('.').pop().toLowerCase()
       const mediaUrl = mediaUrlForPath(cleanPath)

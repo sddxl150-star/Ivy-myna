@@ -814,7 +814,7 @@ def build_system_prompt(agent: dict, room_type: str, other_agents: list = None, 
     else:
         prompt = f"你是 {name}，一个全能智能助手。\n\n{tools_desc}"
 
-    prompt += "\n\n回复使用 Markdown 格式，保持简洁专业。直接执行用户的指令。"
+    prompt += "\n\n回复使用 Markdown 格式，保持简洁专业。直接执行用户的指令。联网搜索、HTTP 请求、浏览网页或引用外部资料时，必须在相关结论后提供来源链接；不要只写“搜索结果显示”而不给 URL。公式和计算过程请直接写成普通 Markdown 文本或代码块，不要用单独的方括号 [ ... ] 包裹。"
 
     room_settings = room_settings or {}
     collaboration_mode = _room_collaboration_mode(room_settings)
