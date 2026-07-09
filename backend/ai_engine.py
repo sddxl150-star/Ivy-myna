@@ -1308,6 +1308,14 @@ async def run_hermes_agent(agent: dict, history: list, system_prompt: str,
                     await callbacks["on_token_usage"](input_tokens, output_tokens)
 
                 final_text = final_result.get("final_response", "")
+                if not final_text:
+                    failure_detail = _extract_failure_detail_from_result(final_result)
+                    if failure_detail:
+                        return _format_model_failure_message(
+                            failure_detail,
+                            status_code=_status_code_from_text(failure_detail),
+                            model=model,
+                        )
             else:
                 final_text = str(final_result) if final_result is not None else ""
 
@@ -1315,7 +1323,12 @@ async def run_hermes_agent(agent: dict, history: list, system_prompt: str,
             # if final_text and on_token:
             #     await on_token(final_text)
 
-            return final_text or None
+            # An entirely empty Hermes result is not a valid completion. Let the
+            # direct OpenAI-compatible fallback try once so users do not get a
+            # misleading generic "no visible content" message from Myna itself.
+            if final_text:
+                return final_text
+            print(f"[AI] Hermes Agent returned empty response for {model}; falling back to direct API")
 
         except InterruptedError:
             raise  # Propagate cancellation/loop detection — don't fallback
@@ -1339,10 +1352,13 @@ def _format_model_failure_message(error: str, *, status_code: int | None = None,
 
     if status_code == 429 or "429" in lower or "rate limit" in lower or "too many requests" in lower:
         reason = "模型服务限流 / 请求过多"
-        advice = "稍等 1–3 分钟后重试，或切换到其它模型；如果多人同时调用，建议降低并发。"
+        advice = "稍等 1-3 分钟后重试，或切换到其它模型；如果多人同时调用，建议降低并发。"
+    elif "quota" in lower or "额度不足" in raw or "insufficient_user_quota" in lower:
+        reason = "模型服务拒绝请求（额度或账户状态）"
+        advice = "这不是 Myna 代码执行失败；请检查上游账号额度/套餐状态，或临时切换备用模型。"
     elif status_code in {401, 403} or "unauthorized" in lower or "forbidden" in lower or "invalid api key" in lower:
-        reason = "模型 API Key 或权限配置异常"
-        advice = "检查模型配置里的 API Key、Base URL、账号额度和该模型权限。"
+        reason = "模型服务拒绝请求（鉴权或模型权限）"
+        advice = "如果 API Key 已确认正常，请检查 Base URL、该模型访问权限、账号状态或上游服务策略。"
     elif status_code and status_code >= 500 or "timeout" in lower or "timed out" in lower or "request timed out" in lower:
         reason = "模型服务超时或上游不可用"
         advice = "稍后重试；如果持续出现，建议切换备用模型或检查上游服务状态。"
@@ -1356,6 +1372,54 @@ def _format_model_failure_message(error: str, *, status_code: int | None = None,
     detail = raw[:300] if raw else f"HTTP {status_code}" if status_code else "无详细错误"
     retry_line = f"\n已重试次数：{retries}" if retries else ""
     return f"⚠️ 任务未完成{model_part}\n\n失败原因：{reason}{retry_line}\n错误详情：{detail}\n\n建议处理：{advice}"
+
+
+
+
+def _extract_failure_detail_from_result(result: dict) -> str:
+    """Extract a useful user-visible failure detail from Hermes/direct result dicts."""
+    if not isinstance(result, dict):
+        return ""
+
+    def _stringify(value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("message", "error", "detail", "reason", "type", "code"):
+                nested = _stringify(value.get(key))
+                if nested:
+                    return nested
+            try:
+                return json.dumps(value, ensure_ascii=False)[:500]
+            except Exception:
+                return str(value)[:500]
+        if isinstance(value, (list, tuple)):
+            parts = [_stringify(item) for item in value]
+            return "; ".join([p for p in parts if p])[:500]
+        return str(value).strip()
+
+    keys = (
+        "error", "error_message", "exception", "message", "detail", "details",
+        "failure_reason", "reason", "status_message", "last_error", "api_error",
+    )
+    for key in keys:
+        detail = _stringify(result.get(key))
+        if detail:
+            return detail
+
+    if result.get("success") is False or result.get("ok") is False:
+        return "Hermes Agent 返回失败状态，但未提供详细错误。"
+    return ""
+
+
+def _status_code_from_text(text: str) -> int | None:
+    match = re.search(r"\b(?:http\s*)?(\d{3})\b", (text or "").lower())
+    if not match:
+        return None
+    code = int(match.group(1))
+    return code if 400 <= code <= 599 else None
 
 
 def _normalize_model_failure_reply(reply: str | None, *, model: str | None = None) -> str | None:
@@ -1372,7 +1436,10 @@ def _normalize_model_failure_reply(reply: str | None, *, model: str | None = Non
         or "timed out" in lower
         or "network" in lower
         or "connection" in lower
-        or re.search(r"http\s+(429|5\d\d)\b", lower)
+        or "quota" in lower
+        or "额度不足" in raw
+        or "insufficient_user_quota" in lower
+        or re.search(r"http\s+(401|403|429|5\d\d)\b", lower)
     )
     already_formatted = raw.startswith("⚠️ 任务未完成") or raw.startswith("⚠️ 模型")
     if looks_like_failure and not already_formatted:
