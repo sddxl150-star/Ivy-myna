@@ -1035,7 +1035,7 @@ function renderMd(text) {
 
     // Convert MEDIA:/path/to/file to displayable content
     // Supports: MEDIA:/path, MEDIA:`/path`, **MEDIA:** `/path`
-    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\n`]*?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|pdf|zip|tar|gz|7z|rar|docx?|xlsx?|pptx?|txt|md|json|csv|sql))`?/gi, (match, filePath) => {
+    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\n`]*?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|pdf|html?|zip|tar|gz|7z|rar|docx?|xlsx?|pptx?|txt|md|json|csv|sql))`?/gi, (match, filePath) => {
       const cleanPath = filePath.trim()
       const ext = cleanPath.split('.').pop().toLowerCase()
       const mediaUrl = mediaUrlForPath(cleanPath)
@@ -1047,9 +1047,11 @@ function renderMd(text) {
         return `<video src="${mediaUrl}" controls style="max-width:100%;border-radius:8px"></video>`
       } else if (ext === 'pdf') {
         return `<a href="${mediaUrl}" target="_blank" rel="noopener noreferrer" class="file-card"><span class="file-card-icon">📄</span><span class="file-card-info"><span class="file-card-name">${safeFileName}</span><span class="file-card-meta">PDF 文档 · 点击预览</span></span></a>`
+      } else if (ext === 'html' || ext === 'htm') {
+        return `<a href="${mediaUrl}" target="_blank" rel="noopener noreferrer" class="file-card"><span class="file-card-icon">🌐</span><span class="file-card-info"><span class="file-card-name">${safeFileName}</span><span class="file-card-meta">HTML 文件 · 点击打开</span></span></a>`
       } else {
         const downloadUrl = mediaUrlForPath(cleanPath, true)
-        const icons = { zip: '🗜️', tar: '🗜️', gz: '🗜️', '7z': '🗜️', rar: '🗜️', doc: '📝', docx: '📝', xls: '📊', xlsx: '📊', ppt: '📽️', pptx: '📽️', txt: '📃', md: '📃', json: '📋', csv: '📊', sql: '🗃️' }
+        const icons = { zip: '🗜️', tar: '🗜️', gz: '🗜️', '7z': '🗜️', rar: '🗜️', doc: '📝', docx: '📝', xls: '📊', xlsx: '📊', ppt: '📽️', pptx: '📽️', txt: '📃', md: '📃', json: '📋', csv: '📊', sql: '🗃️', html: '🌐', htm: '🌐' }
         const icon = icons[ext] || '📎'
         return `<a href="${downloadUrl}" download="${safeFileName}" class="file-card"><span class="file-card-icon">${icon}</span><span class="file-card-info"><span class="file-card-name">${safeFileName}</span><span class="file-card-meta">${ext.toUpperCase()} 文件 · 点击下载</span></span><span class="file-card-dl">⬇</span></a>`
       }
