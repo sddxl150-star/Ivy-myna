@@ -216,7 +216,21 @@ export function togglePinnedConversation(roomId) {
   else delete store.pinnedConversations[roomId]
   store.pinnedConversations = { ...store.pinnedConversations }
   _persistPinnedConversations()
+  savePinnedConversations()
   return nextValue
+}
+
+export async function loadPinnedConversations() {
+  const data = await api('GET', '/admin/pinned-conversations')
+  if (data.ok && data.result && typeof data.result === 'object') {
+    store.pinnedConversations = data.result
+    _persistPinnedConversations()
+  }
+}
+
+export async function savePinnedConversations() {
+  const data = await api('PUT', '/admin/pinned-conversations', { pins: store.pinnedConversations })
+  if (!data.ok) console.warn('Failed to sync pinned conversations:', data.error || data.status)
 }
 
 function _persistUnread() {
@@ -259,14 +273,27 @@ export async function loadConversations(options = {}) {
   const run = Promise.all([
     includeGroups ? api('GET', '/admin/rooms?type=group') : Promise.resolve({ result: store.rooms }),
     includeDms ? api('GET', '/admin/dms') : Promise.resolve({ result: store.dms }),
+    fullRefresh ? api('GET', '/admin/pinned-conversations') : Promise.resolve({ result: store.pinnedConversations }),
   ])
   if (fullRefresh) conversationLoadInFlight = run
-  const [roomData, dmData] = await run
+  const [roomData, dmData, pinData] = await run
   if (fullRefresh) {
     conversationLoadInFlight = null
     lastConversationLoadAt = Date.now()
   }
   if (seq !== conversationLoadSeq) return
+  if (pinData?.ok && pinData.result && typeof pinData.result === 'object') {
+    const serverPins = pinData.result
+    const hasServerPins = Object.keys(serverPins).length > 0
+    const hasLocalPins = Object.keys(store.pinnedConversations || {}).length > 0
+    if (hasServerPins || !hasLocalPins) {
+      store.pinnedConversations = serverPins
+      _persistPinnedConversations()
+    } else {
+      // First run after upgrading from local-only pins: migrate this device's pins to the server.
+      savePinnedConversations()
+    }
+  }
   const sortConversations = (items) => [...items].sort((a, b) => {
     const pinnedA = Boolean(store.pinnedConversations[a.id])
     const pinnedB = Boolean(store.pinnedConversations[b.id])
@@ -552,3 +579,4 @@ export function timeAgo(dateStr) {
   if (diff < 604800) return Math.floor(diff / 86400) + '天前'
   return dateStr.slice(5, 10)
 }
+

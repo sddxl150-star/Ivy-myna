@@ -1475,6 +1475,39 @@ async def clear_recent_logs(request: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"清空日志失败：{e}"}, status_code=500)
 
+
+
+@router.get("/pinned-conversations")
+async def get_pinned_conversations(request: Request):
+    db = get_db(request)
+    raw = db.get_hub_setting("pinned_conversations", "{}")
+    try:
+        pins = json.loads(raw or "{}")
+    except Exception:
+        pins = {}
+    if not isinstance(pins, dict):
+        pins = {}
+    return {"ok": True, "result": pins}
+
+
+@router.put("/pinned-conversations")
+async def update_pinned_conversations(request: Request):
+    body = await request.json()
+    pins = body.get("pins", {})
+    if not isinstance(pins, dict):
+        return JSONResponse({"ok": False, "error": "Invalid pins"}, status_code=400)
+    clean = {}
+    for key, value in pins.items():
+        if not isinstance(key, str) or not key:
+            continue
+        try:
+            clean[key] = int(value)
+        except Exception:
+            clean[key] = 1
+    db = get_db(request)
+    db.set_hub_setting("pinned_conversations", json.dumps(clean, ensure_ascii=False))
+    return {"ok": True, "result": clean}
+
 @router.get("/settings")
 async def get_settings(request: Request):
     blocked = require_admin_account(request)
@@ -1843,3 +1876,4 @@ async def migrate_data_dir(request: Request):
     from paths import migrate_data_dir as do_migrate
     result = do_migrate(new_dir)
     return result
+
