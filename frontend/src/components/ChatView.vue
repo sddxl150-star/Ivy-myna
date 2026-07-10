@@ -1977,7 +1977,7 @@ function buildShareHtml(roomTitle, rows) {
     .msg-meta-row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; font-size:11px; color:var(--text-faint); } .self .msg-meta-row { color:rgba(255,255,255,.7); }
     .empty { color:var(--text-dim); text-align:center; padding:36px 4px; }
     @media (max-width:640px) { header { padding:12px 14px; } main { padding:12px 10px 18px; } .msg { max-width:88%; padding:9px 12px; font-size:14px; } .msg.event { max-width:88%; } h1 { font-size:15px; } }
-  
+
 
 .thread-search-bar {
   margin: 0 0 10px;
