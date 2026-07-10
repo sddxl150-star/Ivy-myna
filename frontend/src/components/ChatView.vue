@@ -205,12 +205,17 @@
             </button>
           </div>
           <div class="thread-drawer-body">
+            <div class="thread-search-bar search-bar">
+              <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+              <input type="search" v-model.trim="threadFilter" placeholder="搜索对话..." aria-label="搜索对话">
+            </div>
             <button class="thread-new-btn" @click="createThread">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
               新建对话
             </button>
             <div class="thread-list">
               <div
+                v-if="threadMatches('', '主线', '默认对话')"
                 class="thread-item"
                 :class="{ active: !activeThreadId }"
                 @click="selectThread(null); threadDrawerOpen = false"
@@ -219,7 +224,7 @@
                 <div class="thread-item-preview">默认对话</div>
               </div>
               <div
-                v-for="t in threads"
+                v-for="t in filteredThreads"
                 :key="t.id"
                 class="thread-item"
                 :class="{ active: activeThreadId === t.id }"
@@ -457,6 +462,7 @@ let dragDepth = 0
 const threads = ref([])
 const activeThreadId = ref(null)
 const threadDrawerOpen = ref(false)
+const threadFilter = ref('')
 const showPlusMenu = ref(false)
 const showShortcutBar = ref(false)
 const shortcutPosition = ref({ x: null, y: null })
@@ -1281,6 +1287,15 @@ async function fetchThreads() {
   threads.value = data.result || []
 }
 
+
+const filteredThreads = computed(() => threads.value.filter(t => threadMatches(t.id, t.title, t.last_message)))
+
+function threadMatches(id, title, preview) {
+  const q = String(threadFilter.value || '').trim().toLowerCase()
+  if (!q) return true
+  return [id, title, preview].some(value => String(value || '').toLowerCase().includes(q))
+}
+
 function selectThread(threadId) {
   activeThreadId.value = threadId
   messages.value = []
@@ -1962,7 +1977,17 @@ function buildShareHtml(roomTitle, rows) {
     .msg-meta-row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; font-size:11px; color:var(--text-faint); } .self .msg-meta-row { color:rgba(255,255,255,.7); }
     .empty { color:var(--text-dim); text-align:center; padding:36px 4px; }
     @media (max-width:640px) { header { padding:12px 14px; } main { padding:12px 10px 18px; } .msg { max-width:88%; padding:9px 12px; font-size:14px; } .msg.event { max-width:88%; } h1 { font-size:15px; } }
-  </style>
+  
+
+.thread-search-bar {
+  margin: 0 0 10px;
+}
+
+.thread-search-bar input {
+  min-height: 38px;
+}
+
+</style>
 </head>
 <body>
   <div class="shell">
