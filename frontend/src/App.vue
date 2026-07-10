@@ -190,6 +190,8 @@ const currentRoomType = ref('group')
 const currentAgent = ref(null)
 const languageMenuOpen = ref(false)
 const modals = reactive({ room: false, agent: false })
+const defaultEntryOpened = ref(false)
+const defaultEntryDismissed = ref(false)
 
 // Desktop detection (reactive)
 const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 0)
@@ -235,6 +237,7 @@ function openChat(room, type) {
 
 function closeChat() {
   currentRoom.value = null
+  defaultEntryDismissed.value = true
   // Replace state to list view
   history.replaceState({ view: 'list' }, '', '#')
 }
@@ -269,6 +272,32 @@ function onRoomCreated(room) {
 function openSettingsRoom(room) {
   page.value = 'chats'
   openChat(room, 'group')
+}
+
+async function openDefaultEntryChat() {
+  if (defaultEntryOpened.value || defaultEntryDismissed.value || currentRoom.value || currentAgent.value) return
+  if (/^#(chat|agent)\//.test(window.location.hash)) return
+  defaultEntryOpened.value = true
+  try {
+    if (!store.agents.length) await loadAgents()
+    const settings = await api('GET', '/admin/settings')
+    const configuredId = settings?.result?.orchestrator_agent_id || settings?.result?.default_orchestrator_agent_id || ''
+    let agent = configuredId ? store.agents.find(a => a.id === configuredId) : null
+    if (!agent) agent = store.agents.find(a => a.name === '马哥')
+    if (!agent) agent = store.agents.find(a => /统筹|协同/.test(a.name || a.description || ''))
+    if (!agent) return
+    const dm = await api('POST', `/admin/dm/${agent.id}`)
+    if (!dm.ok || !dm.result?.room_id) return
+    await loadConversations({ force: true })
+    const room = store.dms.find(item => item.id === dm.result.room_id)
+    if (!room || currentRoom.value || defaultEntryDismissed.value) return
+    page.value = 'chats'
+    currentRoom.value = room
+    currentRoomType.value = 'dm'
+    history.replaceState({ view: 'default-chat', roomId: room.id }, '', '#')
+  } catch (e) {
+    console.warn('Failed to open default entry chat:', e)
+  }
 }
 
 
@@ -316,6 +345,7 @@ async function restoreRouteFromHash() {
   const match = window.location.hash.match(/^#(chat|agent)\/([^?&]+)/)
   if (!match) {
     history.replaceState({ view: 'list' }, '', '#')
+    await openDefaultEntryChat()
     return
   }
 
