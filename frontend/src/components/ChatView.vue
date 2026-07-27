@@ -949,6 +949,68 @@ function sortChatMessages(list) {
   ))
 }
 
+function normalizeUrlHref(url) {
+  if (/^https?:\/\//i.test(url)) return url
+  if (/^localhost(?::\d+)?(?:[/?#]|$)/i.test(url)) return `http://${url}`
+  if (/^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]|$)/.test(url)) return `http://${url}`
+  return `https://${url}`
+}
+
+const BARE_URL_PREFIX_RE = /^(https?:\/\/[A-Za-z0-9](?:[A-Za-z0-9\-._~:\/?#[\]@!$&'()*+,;=%]*[A-Za-z0-9\/_~#=%-])?|www\.[A-Za-z0-9](?:[A-Za-z0-9\-._~:\/?#[\]@!$&'()*+,;=%]*[A-Za-z0-9\/_~#=%-])?)/i
+const URL_TRAILING_PUNCT_RE = /[.,;:!?，。；：！？、)）\]】}》>]+$/
+
+function splitBareUrlText(rawText) {
+  const text = String(rawText || '')
+  const match = text.match(BARE_URL_PREFIX_RE)
+  if (!match) return null
+  const urlText = match[0].replace(URL_TRAILING_PUNCT_RE, '')
+  if (!urlText) return null
+  return { urlText, restText: text.slice(urlText.length) }
+}
+
+function autoLinkUrls(text) {
+  const protectedSegments = []
+  const fileLikeExtensions = new Set([
+    'vue', 'css', 'scss', 'sass', 'less', 'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs',
+    'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'php', 'cs', 'cpp', 'c', 'h',
+    'json', 'yaml', 'yml', 'toml', 'ini', 'env', 'md', 'txt', 'csv', 'sql',
+    'html', 'xml', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'pdf',
+    'zip', 'tar', 'gz', 'rar', '7z', 'mp3', 'mp4', 'mov', 'avi', 'webm',
+  ])
+  const protect = (match) => {
+    protectedSegments.push(match)
+    return `__PROTECTED_SEGMENT_${protectedSegments.length - 1}__`
+  }
+
+  let linked = text
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/`[^`\n]+`/g, protect)
+    .replace(/!?\[[^\]\n]+\]\([^\)\n]+\)/g, protect)
+
+  const urlChars = String.raw`[A-Za-z0-9._~:/?#\[\]@!$&'*+,;=%-]`
+  const urlTail = String.raw`(?:${urlChars}+)?`
+  const urlPattern = new RegExp(String.raw`(^|[\s>（(])((?:(?:https?:\/\/|www\.)${urlChars}+)|(?:localhost(?::\d+)?(?:[/?#]${urlTail})?)|(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]${urlTail})?)|(?:(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]${urlTail})?))`, 'gi')
+
+  linked = linked.replace(urlPattern, (match, prefix, rawUrl) => {
+    const split = splitBareUrlText(rawUrl)
+    if (!split) return match
+    const url = split.urlText
+    const trailing = split.restText
+    const lowerUrl = url.toLowerCase()
+    const explicitUrl = /^(?:https?:\/\/|www\.|localhost(?::|[/?#]|$)|(?:\d{1,3}\.){3}\d{1,3})/i.test(url)
+    const pathStart = lowerUrl.search(/[/?#:]/)
+    const host = pathStart >= 0 ? lowerUrl.slice(0, pathStart) : lowerUrl
+    const tld = host.split('.').pop()
+    if (!explicitUrl && fileLikeExtensions.has(tld)) {
+      return match
+    }
+    const href = normalizeUrlHref(url)
+    return `${prefix}[${url}](${href})${trailing}`
+  })
+
+  return linked.replace(/__PROTECTED_SEGMENT_(\d+)__/g, (_, i) => protectedSegments[i])
+}
+
 function renderMd(text) {
   if (!text) return ''
   try {
@@ -956,7 +1018,7 @@ function renderMd(text) {
 
     // Convert MEDIA:/path/to/file to displayable content
     // Supports: MEDIA:/path, MEDIA:`/path`, **MEDIA:** `/path`
-    let processed = text.replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\s\n`]+)`?/g, (match, filePath) => {
+    let processed = autoLinkUrls(text).replace(/(?:\*{0,2}MEDIA:?\*{0,2})\s*`?(\/[^\s\n`]+)`?/g, (match, filePath) => {
       const ext = filePath.split('.').pop().toLowerCase()
       const mediaUrl = `/admin/media${filePath}`
       if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
@@ -994,11 +1056,16 @@ function renderMd(text) {
     processed = processed.replace(/__CODE_BLOCK_(\d+)__/g, (_, i) => codeBlocks[i])
     let html = marked.parse(processed)
     html = html.replace(/<table>/g, '<div class="table-wrapper"><table>').replace(/<\/table>/g, '</table></div>')
+    html = html.replace(/<a\b(?![^>]*\bclass=)/g, '<a class="message-link"')
+    html = html.replace(/<a([^>]*\bclass=["'])([^"']*)(["'][^>]*)/g, '<a$1$2 message-link$3')
+    html = html.replace(/<a\b(?![^>]*\btarget=)/g, '<a target="_blank"')
+    html = html.replace(/<a\b(?![^>]*\brel=)/g, '<a rel="noopener noreferrer"')
+    html = html.replace(/<a\b(?![^>]*\bonclick=)/g, '<a onclick="event.stopPropagation()"')
     html = html.replace(/<img /g, '<img style="max-width:100%;max-height:300px;border-radius:8px;cursor:pointer;display:block;margin:4px 0" onclick="window.open(this.src)" ')
     // Sanitize with DOMPurify to prevent XSS while keeping rich content
     html = DOMPurify.sanitize(html, {
       ALLOWED_TAGS: ['a','b','i','em','strong','code','pre','p','br','ul','ol','li','h1','h2','h3','h4','h5','h6','table','thead','tbody','tr','th','td','div','span','img','video','source','blockquote','details','summary','del','ins','sup','sub','hr','ruby','rt','rp'],
-      ALLOWED_ATTR: ['href','target','style','class','id','src','alt','title','controls','download','onclick','colspan','rowspan','width','height','align','valign'],
+      ALLOWED_ATTR: ['href','target','rel','style','class','id','src','alt','title','controls','download','onclick','colspan','rowspan','width','height','align','valign'],
       ALLOW_DATA_ATTR: false,
       FORBID_TAGS: ['script','style','iframe','object','embed','form','input','textarea','select','button','link','meta','noscript'],
       FORBID_ATTR: ['onerror','onload','onmouseover','onfocus','onblur','onsubmit','onchange','formaction'],
