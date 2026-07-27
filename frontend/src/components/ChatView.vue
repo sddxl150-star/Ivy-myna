@@ -1057,7 +1057,7 @@ function renderMd(text) {
     let html = marked.parse(processed)
     html = html.replace(/<table>/g, '<div class="table-wrapper"><table>').replace(/<\/table>/g, '</table></div>')
     html = html.replace(/<a\b(?![^>]*\bclass=)/g, '<a class="message-link"')
-    html = html.replace(/<a([^>]*\bclass=["'])([^"']*)(["'][^>]*)/g, '<a$1$2 message-link$3')
+    html = html.replace(/<a([^>]*\bclass=["'])((?!.*message-link)[^"']*)(["'][^>]*)/g, '<a$1$2 message-link$3')
     html = html.replace(/<a\b(?![^>]*\btarget=)/g, '<a target="_blank"')
     html = html.replace(/<a\b(?![^>]*\brel=)/g, '<a rel="noopener noreferrer"')
     html = html.replace(/<a\b(?![^>]*\bonclick=)/g, '<a onclick="event.stopPropagation()"')
